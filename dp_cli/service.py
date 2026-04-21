@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from drissionpage_cli.adapter import DrissionPageAdapter
-from drissionpage_cli.errors import (
+from collections.abc import Callable
+from contextlib import contextmanager
+
+from dp_cli.adapter import DrissionPageAdapter
+from dp_cli.errors import (
     ElementNotFoundError,
     InvalidInputError,
     RefNotFoundError,
     RefStaleError,
 )
-from drissionpage_cli.models import DEFAULT_SESSION
-from drissionpage_cli.session import SessionManager
+from dp_cli.models import DEFAULT_SESSION
+from dp_cli.session import SessionManager
 
 
 class CliService:
@@ -17,19 +20,20 @@ class CliService:
         self.adapter = adapter or DrissionPageAdapter()
 
     def open_page(self, url: str, session: str = DEFAULT_SESSION, headless: bool | None = None) -> dict:
-        with self.sessions.open_runtime(session=session, headless=headless) as runtime:
+        with self._with_runtime(session=session, headless=headless) as runtime:
             page = self.adapter.open_url(runtime.tab, url)
             runtime.sync_page_identity()
-            runtime.save()
+            runtime.persist()
             return {"page": page}
 
     def snapshot_page(self, session: str = DEFAULT_SESSION, headless: bool | None = None) -> dict:
-        with self.sessions.open_runtime(session=session, headless=headless) as runtime:
+        with self._with_runtime(session=session, headless=headless) as runtime:
             runtime.begin_snapshot()
             elements = runtime.upsert_refs(self.adapter.interactive_elements(runtime.tab))
+            runtime.persist()
             return {
-                "page": self.adapter.page_info(runtime.tab),
-                "page_identity": self._page_identity(runtime),
+                "page": self._page_payload(runtime),
+                "page_identity": self._page_identity_payload(runtime),
                 "count": len(elements),
                 "elements": elements,
             }
@@ -43,16 +47,17 @@ class CliService:
     ) -> dict:
         if not locator and not text:
             raise InvalidInputError("find requires either --locator or --text.")
-        with self.sessions.open_runtime(session=session, headless=headless) as runtime:
+        with self._with_runtime(session=session, headless=headless) as runtime:
             runtime.begin_snapshot()
             if locator:
                 records = self.adapter.find_by_locator(runtime.tab, locator)
             else:
                 records = self.adapter.find_by_text(runtime.tab, text or "")
             elements = runtime.upsert_refs(records)
+            runtime.persist()
             return {
-                "page": self.adapter.page_info(runtime.tab),
-                "page_identity": self._page_identity(runtime),
+                "page": self._page_payload(runtime),
+                "page_identity": self._page_identity_payload(runtime),
                 "count": len(elements),
                 "elements": elements,
                 "query": {"locator": locator, "text": text},
@@ -65,15 +70,18 @@ class CliService:
         locator: str | None = None,
         headless: bool | None = None,
     ) -> dict:
-        with self.sessions.open_runtime(session=session, headless=headless) as runtime:
-            target_locator = self._resolve_target(runtime, ref, locator)
-            element = self.adapter.resolve(runtime.tab, target_locator)
-            if not element:
-                raise ElementNotFoundError("Could not find element to click.", {"locator": target_locator})
-            self.adapter.click(element)
-            runtime.sync_page_identity()
-            runtime.save()
-            return {"page": self.adapter.page_info(runtime.tab), "target": {"ref": ref, "locator": target_locator}}
+        return self._perform_element_action(
+            session=session,
+            headless=headless,
+            ref=ref,
+            locator=locator,
+            element_error_message="Could not find element to click.",
+            action=lambda element, _text: self.adapter.click(element),
+            include_payload=lambda runtime, target_locator: {
+                "page": self._page_payload(runtime),
+                "target": self._target_payload(ref, target_locator),
+            },
+        )
 
     def type_into_element(
         self,
@@ -83,21 +91,23 @@ class CliService:
         locator: str | None = None,
         headless: bool | None = None,
     ) -> dict:
-        with self.sessions.open_runtime(session=session, headless=headless) as runtime:
-            target_locator = self._resolve_target(runtime, ref, locator)
-            element = self.adapter.resolve(runtime.tab, target_locator)
-            if not element:
-                raise ElementNotFoundError("Could not find element to type into.", {"locator": target_locator})
-            self.adapter.type_text(element, text)
-            runtime.save()
-            return {
-                "page": self.adapter.page_info(runtime.tab),
-                "target": {"ref": ref, "locator": target_locator},
+        return self._perform_element_action(
+            session=session,
+            headless=headless,
+            ref=ref,
+            locator=locator,
+            text=text,
+            element_error_message="Could not find element to type into.",
+            action=lambda element, value: self.adapter.type_text(element, value or ""),
+            include_payload=lambda runtime, target_locator: {
+                "page": self._page_payload(runtime),
+                "target": self._target_payload(ref, target_locator),
                 "typed_text": text,
-            }
+            },
+        )
 
     def inspect_session(self, session: str = DEFAULT_SESSION, headless: bool | None = None) -> dict:
-        with self.sessions.open_runtime(session=session, headless=headless) as runtime:
+        with self._with_runtime(session=session, headless=headless) as runtime:
             return {
                 "session_name": runtime.meta.session,
                 "session_id": runtime.meta.session_id,
@@ -120,16 +130,31 @@ class CliService:
                 "ref_count": len(runtime.state.refs),
             }
 
-    def _resolve_target(
-        self,
-        runtime,
-        ref: str | None,
-        locator: str | None,
-    ) -> str:
+    @contextmanager
+    def _with_runtime(self, session: str, headless: bool | None):
+        with self.sessions.open_runtime(session=session, headless=headless) as runtime:
+            yield runtime
+
+    def _page_payload(self, runtime) -> dict:
+        return self.adapter.page_info(runtime.tab)
+
+    def _page_identity_payload(self, runtime) -> dict:
+        return {
+            "runtime_id": runtime.meta.runtime_id,
+            "page_id": runtime.state.active_page.page_id,
+            "snapshot_id": runtime.state.active_page.snapshot_id,
+            "snapshot_seq": runtime.state.active_page.snapshot_seq,
+        }
+
+    def _target_payload(self, ref: str | None, locator: str) -> dict:
+        return {"ref": ref, "locator": locator}
+
+    def _resolve_target(self, runtime, ref: str | None, locator: str | None) -> str:
         if ref:
-            item = runtime.state.refs.get(ref)
-            if not item:
-                raise RefNotFoundError(ref)
+            try:
+                item = runtime.ref_item(ref)
+            except KeyError as exc:
+                raise RefNotFoundError(ref) from exc
             if item.get("runtime_id") != runtime.meta.runtime_id:
                 raise RefStaleError(
                     ref,
@@ -152,10 +177,23 @@ class CliService:
             return locator
         raise InvalidInputError("Command requires either --ref or --locator.")
 
-    def _page_identity(self, runtime) -> dict:
-        return {
-            "runtime_id": runtime.meta.runtime_id,
-            "page_id": runtime.state.active_page.page_id,
-            "snapshot_id": runtime.state.active_page.snapshot_id,
-            "snapshot_seq": runtime.state.active_page.snapshot_seq,
-        }
+    def _perform_element_action(
+        self,
+        session: str,
+        headless: bool | None,
+        ref: str | None,
+        locator: str | None,
+        element_error_message: str,
+        action: Callable,
+        include_payload: Callable,
+        text: str | None = None,
+    ) -> dict:
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            target_locator = self._resolve_target(runtime, ref, locator)
+            element = self.adapter.resolve(runtime.tab, target_locator)
+            if not element:
+                raise ElementNotFoundError(element_error_message, {"locator": target_locator})
+            action(element, text)
+            runtime.sync_page_identity()
+            runtime.persist()
+            return include_payload(runtime, target_locator)

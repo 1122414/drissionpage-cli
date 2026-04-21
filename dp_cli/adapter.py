@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-from drissionpage_cli.models import ElementRecord, INTERACTIVE_LOCATOR
+from dp_cli.models import ElementRecord, INTERACTIVE_LOCATOR
 
 ELEMENT_METADATA_SCRIPT = """
 function buildXPath(node) {
@@ -107,4 +107,3 @@ class DrissionPageAdapter:
             record = ElementRecord(**payload)
             records[record.xpath] = record
         return list(records.values())
-

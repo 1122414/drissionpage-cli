@@ -1,14 +1,15 @@
-# drissionpage-cli
+# dp-cli
 
-对 DrissionPage 做 Agent-first CLI 化的最小 v0 实现。
-
-当前提供的首批命令：
+面向 Agent 的 DrissionPage CLI 最小实现。当前版本已经完成 MVP 和 v0.1 会话身份机制，提供稳定的基础浏览器动作闭环：
 
 - `open`
 - `snapshot`
 - `find`
 - `click`
 - `type`
+- `session inspect`
+
+所有命令统一输出 JSON，适合人手动调用，也适合作为 Agent 的执行边界。
 
 ## 环境准备
 
@@ -24,9 +25,30 @@ conda activate dp-cli
 pip install DrissionPage pytest
 ```
 
-## 通用规则
+## 项目结构
 
-所有命令都统一输出 JSON，至少包含：
+```text
+dp_cli/
+  cli.py            # CLI 参数解析与统一 JSON 输出
+  service.py        # 命令用例编排
+  session.py        # 会话管理与浏览器恢复
+  session_store.py  # session 元数据与状态持久化
+  runtime.py        # runtime/page/ref 生命周期
+  adapter.py        # DrissionPage 适配层
+  models.py         # 数据模型与常量
+  errors.py         # 结构化错误
+tests/
+  support.py        # 测试与脚本共享工作流
+  test_cli_local.py
+  test_public_smoke.py
+scripts/
+  test_local_cli.py
+  test_public_smoke.py
+```
+
+## JSON 输出约定
+
+所有命令至少返回以下字段：
 
 - `ok`
 - `session`
@@ -34,262 +56,155 @@ pip install DrissionPage pytest
 - `data`
 - `error`
 
-当前最常用的公共选项：
+失败时 `error` 会包含：
+
+- `code`
+- `message`
+- `details`
+
+## Session / Runtime / Page / Ref
+
+当前版本会把 session 状态持久化在：
+
+```text
+.dpcli/sessions/<session-name>/
+```
+
+其中：
+
+- `session`
+  - 用户传入的逻辑会话名，例如 `demo`
+- `session_id`
+  - session 的稳定内部标识
+- `runtime_id`
+  - 当前浏览器实例标识，用来判断是不是同一个活会话
+- `page_id`
+  - 当前页面身份
+- `snapshot_id`
+  - 当前快照代际
+- `ref`
+  - 由 `snapshot` / `find` 产出的元素引用，只在对应 runtime/page 上有效
+
+如果页面或 runtime 已经变化，旧 `ref` 会返回 `ref_stale`，而不是静默误用。
+
+## 常用选项
 
 - `--session`
-  - 指定会话名
-  - 不传时默认使用 `default`
+  - 指定会话名，不传时默认使用 `default`
 - `--headless`
-  - 使用无头浏览器运行
-  - 适合自动化测试和 Agent 调用
+  - 使用无头浏览器执行
 
-最常见的调用形式：
-
-```bash
-python -m drissionpage_cli <command> [args] [options]
-```
-
-## 命令说明
-
-### 1. `open`
-
-打开一个页面，并返回页面基本信息。
-
-基本用法：
+通用调用形式：
 
 ```bash
-python -m drissionpage_cli open https://example.com
+python -m dp_cli <command> [args] [options]
 ```
 
-指定 session：
+## 命令示例
+
+### open
 
 ```bash
-python -m drissionpage_cli open https://example.com --session demo
+python -m dp_cli open https://example.com
+python -m dp_cli open https://example.com --session demo
+python -m dp_cli open https://example.com --session demo --headless
 ```
 
-无头模式：
+### snapshot
 
 ```bash
-python -m drissionpage_cli open https://example.com --session demo --headless
+python -m dp_cli snapshot --session demo
+python -m dp_cli snapshot --session demo --headless
 ```
 
-本地夹具页示例：
+### find
+
+按 locator 查找：
 
 ```bash
-python -m drissionpage_cli open http://127.0.0.1:8000/index.html --session local-demo --headless
+python -m dp_cli find --session demo --locator "#name-input"
+python -m dp_cli find --session demo --locator "tag:a"
 ```
 
-### 2. `snapshot`
-
-获取当前页面的结构化快照，返回页面信息和可交互元素列表，并为元素分配 `ref`。
-
-基本用法：
+按文本查找：
 
 ```bash
-python -m drissionpage_cli snapshot
+python -m dp_cli find --session demo --text "Primary Action"
+python -m dp_cli find --session demo --headless --text "Learn more"
 ```
 
-指定 session：
+### click
+
+先查找再点击：
 
 ```bash
-python -m drissionpage_cli snapshot --session demo
+python -m dp_cli find --session demo --headless --text "Primary Action"
+python -m dp_cli click --session demo --headless --ref e1
 ```
-
-无头模式：
-
-```bash
-python -m drissionpage_cli snapshot --session demo --headless
-```
-
-典型用途：
-
-```bash
-python -m drissionpage_cli open https://example.com --session demo --headless
-python -m drissionpage_cli snapshot --session demo --headless
-```
-
-### 3. `find`
-
-按 locator 或文本查找元素，返回匹配元素和对应 `ref`。
-
-#### 选项
-
-- `--locator`
-  - 用 DrissionPage 原生定位语法查找
-- `--text`
-  - 按文本内容模糊查找
-
-#### 用 `--locator`
-
-按 id 查找：
-
-```bash
-python -m drissionpage_cli find --session demo --locator "#name-input"
-```
-
-按标签查找：
-
-```bash
-python -m drissionpage_cli find --session demo --locator "tag:a"
-```
-
-按文本 locator 查找：
-
-```bash
-python -m drissionpage_cli find --session demo --locator "text:Primary Action"
-```
-
-带无头模式：
-
-```bash
-python -m drissionpage_cli find --session demo --headless --locator "#name-input"
-```
-
-#### 用 `--text`
-
-按按钮文案查找：
-
-```bash
-python -m drissionpage_cli find --session demo --text "Primary Action"
-```
-
-按链接文本查找：
-
-```bash
-python -m drissionpage_cli find --session demo --headless --text "More information"
-```
-
-### 4. `click`
-
-点击元素。支持 `--ref` 和 `--locator` 两种目标指定方式，其中 `--ref` 优先级更高。
-
-#### 选项
-
-- `--ref`
-  - 使用前面 `snapshot` 或 `find` 返回的元素引用
-- `--locator`
-  - 直接传 DrissionPage locator
-
-#### 用 `--ref`
-
-先找元素，再点击：
-
-```bash
-python -m drissionpage_cli find --session demo --headless --text "Primary Action"
-python -m drissionpage_cli click --session demo --headless --ref e1
-```
-
-#### 用 `--locator`
 
 直接按 locator 点击：
 
 ```bash
-python -m drissionpage_cli click --session demo --locator "#primary-action"
+python -m dp_cli click --session demo --locator "#primary-action"
+python -m dp_cli click --session demo --headless --locator "tag:a"
 ```
 
-点击链接：
+### type
+
+先查找再输入：
 
 ```bash
-python -m drissionpage_cli click --session demo --headless --locator "tag:a"
+python -m dp_cli find --session demo --headless --locator "#name-input"
+python -m dp_cli type --session demo --headless --ref e1 --text "Agentic CLI"
 ```
-
-### 5. `type`
-
-向输入框或可输入元素写入文本。支持 `--ref` 和 `--locator` 两种目标指定方式。
-
-#### 选项
-
-- `--ref`
-  - 使用已返回的元素引用
-- `--locator`
-  - 直接传 DrissionPage locator
-- `--text`
-  - 要输入的文本，必填
-
-#### 用 `--ref`
-
-先查输入框，再输入：
-
-```bash
-python -m drissionpage_cli find --session demo --headless --locator "#name-input"
-python -m drissionpage_cli type --session demo --headless --ref e2 --text "Agentic CLI"
-```
-
-#### 用 `--locator`
 
 直接按 locator 输入：
 
 ```bash
-python -m drissionpage_cli type --session demo --locator "#name-input" --text "hello"
+python -m dp_cli type --session demo --locator "#name-input" --text "hello"
+python -m dp_cli type --session demo --headless --locator "#name-input" --text "typed in headless mode"
 ```
 
-无头模式下输入：
+### session inspect
 
 ```bash
-python -m drissionpage_cli type --session demo --headless --locator "#name-input" --text "typed in headless mode"
+python -m dp_cli session inspect --session demo
+python -m dp_cli session inspect --session demo --headless
 ```
 
-## 常见工作流示例
+## 手工 smoke 入口
 
-### 本地页面完整流程
+`scripts/` 保留为人工执行入口，但真实流程只维护一份，复用的是 `tests/support.py` 里的共享 workflow。
 
-```bash
-python -m drissionpage_cli open http://127.0.0.1:8000/index.html --session local-demo --headless
-python -m drissionpage_cli find --session local-demo --headless --locator "#name-input"
-python -m drissionpage_cli type --session local-demo --headless --ref e1 --text "Agentic CLI"
-python -m drissionpage_cli find --session local-demo --headless --text "Primary Action"
-python -m drissionpage_cli click --session local-demo --headless --ref e2
-python -m drissionpage_cli snapshot --session local-demo --headless
-```
-
-### 公网页面简单流程
-
-```bash
-python -m drissionpage_cli open https://example.com --session smoke --headless
-python -m drissionpage_cli find --session smoke --headless --locator "tag:a"
-python -m drissionpage_cli click --session smoke --headless --ref e1
-python -m drissionpage_cli snapshot --session smoke --headless
-```
-
-## 测试
-
-### 本地回归测试
-
-运行 pytest：
-
-```bash
-pytest -q tests/test_cli_local.py
-```
-
-运行本地脚本：
+本地闭环：
 
 ```bash
 python scripts/test_local_cli.py
 ```
 
-### 公网 smoke test
-
-启用公网 smoke：
-
-```bash
-set DPCLI_RUN_PUBLIC_SMOKE=1
-```
-
-运行 pytest：
-
-```bash
-pytest -q tests/test_public_smoke.py
-```
-
-运行脚本：
+公网 smoke：
 
 ```bash
 python scripts/test_public_smoke.py
 ```
 
-### 全量测试
+## 测试
+
+本地回归：
+
+```bash
+pytest -q tests/test_cli_local.py
+```
+
+全部测试：
+
+```bash
+pytest -q tests
+```
+
+启用公网 smoke：
 
 ```bash
 set DPCLI_RUN_PUBLIC_SMOKE=1
-pytest -q tests
+pytest -q tests/test_public_smoke.py
 ```

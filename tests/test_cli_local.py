@@ -2,40 +2,38 @@ from __future__ import annotations
 
 import json
 
-from drissionpage_cli.session import SessionManager
-from tests.support import cleanup_session, run_cli
+from dp_cli.session import SessionManager
+from tests.support import cleanup_session, run_cli, run_local_workflow
 
 
 def test_local_cli_workflow(local_fixture_server, local_session):
     try:
-        opened = run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        results = run_local_workflow(local_session, local_fixture_server.url)
+        opened = results["opened"]
         assert opened["ok"] is True
         assert opened["data"]["page"]["title"] == "DrissionPage CLI Fixture"
 
-        snapshot = run_cli("snapshot", "--session", local_session, "--headless")
+        snapshot = results["snapshot"]
         assert snapshot["ok"] is True
         assert snapshot["data"]["count"] >= 4
         assert snapshot["data"]["page_identity"]["runtime_id"]
         assert snapshot["data"]["page_identity"]["page_id"]
         assert snapshot["data"]["page_identity"]["snapshot_id"]
 
-        button_match = run_cli("find", "--session", local_session, "--headless", "--text", "Primary Action")
+        button_match = results["button_match"]
         assert button_match["ok"] is True
-        button_ref = button_match["data"]["elements"][0]["ref"]
         assert button_match["data"]["elements"][0]["runtime_id"] == button_match["data"]["page_identity"]["runtime_id"]
         assert button_match["data"]["elements"][0]["page_id"] == button_match["data"]["page_identity"]["page_id"]
 
-        input_match = run_cli("find", "--session", local_session, "--headless", "--locator", "#name-input")
+        input_match = results["input_match"]
         assert input_match["ok"] is True
-        input_ref = input_match["data"]["elements"][0]["ref"]
-
-        typed = run_cli("type", "--session", local_session, "--headless", "--ref", input_ref, "--text", "Agentic CLI")
+        typed = results["typed"]
         assert typed["ok"] is True
 
-        clicked = run_cli("click", "--session", local_session, "--headless", "--ref", button_ref)
+        clicked = results["clicked"]
         assert clicked["ok"] is True
 
-        final_snapshot = run_cli("snapshot", "--session", local_session, "--headless")
+        final_snapshot = results["snapshot"]
         elements = final_snapshot["data"]["elements"]
         button = next(item for item in elements if item["id"] == "primary-action")
         text_input = next(item for item in elements if item["id"] == "name-input")
@@ -114,5 +112,38 @@ def test_session_inspect_returns_agent_friendly_identity(local_fixture_server, l
         assert data["runtime"]["status"] == "running"
         assert data["page"]["page_id"]
         assert data["page"]["url"] == local_fixture_server.url
+    finally:
+        cleanup_session(local_session)
+
+
+def test_runtime_persist_keeps_meta_and_state_identity(local_fixture_server, local_session):
+    manager = SessionManager()
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        run_cli("snapshot", "--session", local_session, "--headless")
+
+        paths = manager.session_paths(local_session)
+        meta = json.loads(paths.meta_file.read_text(encoding="utf-8"))
+        state = json.loads(paths.state_file.read_text(encoding="utf-8"))
+
+        assert meta["session_id"]
+        assert meta["runtime_id"]
+        assert meta["runtime_status"] == "running"
+        assert state["session_id"] == meta["session_id"]
+        assert state["runtime_id"] == meta["runtime_id"]
+        assert state["active_page"]["page_id"]
+        assert state["active_page"]["snapshot_id"]
+    finally:
+        cleanup_session(local_session)
+
+
+def test_local_workflow_helper_is_script_safe(local_fixture_server, local_session):
+    try:
+        results = run_local_workflow(local_session, local_fixture_server.url, typed_text="Helper Flow")
+        assert results["opened"]["ok"] is True
+        assert results["clicked"]["data"]["target"]["ref"] == results["button_ref"]
+        snapshot = results["snapshot"]
+        text_input = next(item for item in snapshot["data"]["elements"] if item["id"] == "name-input")
+        assert text_input["value"] == "Helper Flow"
     finally:
         cleanup_session(local_session)

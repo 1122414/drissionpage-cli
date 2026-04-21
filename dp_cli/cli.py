@@ -4,13 +4,13 @@ import argparse
 import json
 from typing import Any
 
-from drissionpage_cli.errors import CliError
-from drissionpage_cli.models import DEFAULT_SESSION
-from drissionpage_cli.service import CliService
+from dp_cli.errors import CliError
+from dp_cli.models import DEFAULT_SESSION
+from dp_cli.service import CliService
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="drissionpage-cli")
+    parser = argparse.ArgumentParser(prog="dp-cli")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     open_parser = subparsers.add_parser("open", help="Open a page in the session browser.")

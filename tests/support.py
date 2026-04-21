@@ -12,7 +12,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from drissionpage_cli.session import SessionManager
+from dp_cli.session import SessionManager
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "site"
@@ -46,23 +46,57 @@ class LocalFixtureServer:
 
 
 def run_cli(*args: str, check: bool = True) -> dict:
-    command = [sys.executable, "-m", "drissionpage_cli", *args]
+    command = [sys.executable, "-X", "utf8", "-m", "dp_cli", *args]
     completed = subprocess.run(
         command,
         cwd=REPO_ROOT,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
         check=False,
     )
-    payload = json.loads(completed.stdout)
+    stdout = completed.stdout.decode("utf-8", errors="replace")
+    stderr = completed.stderr.decode("utf-8", errors="replace")
+    payload = json.loads(stdout)
     if check and completed.returncode != 0:
         raise AssertionError(
-            f"CLI command failed: {' '.join(command)}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+            f"CLI command failed: {' '.join(command)}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )
     payload["_returncode"] = completed.returncode
-    payload["_stderr"] = completed.stderr
+    payload["_stderr"] = stderr
     return payload
+
+
+def run_local_workflow(session: str, url: str, typed_text: str = "Agentic CLI") -> dict:
+    opened = run_cli("open", url, "--session", session, "--headless")
+    button_match = run_cli("find", "--session", session, "--headless", "--text", "Primary Action")
+    input_match = run_cli("find", "--session", session, "--headless", "--locator", "#name-input")
+    button_ref = button_match["data"]["elements"][0]["ref"]
+    input_ref = input_match["data"]["elements"][0]["ref"]
+    typed = run_cli("type", "--session", session, "--headless", "--ref", input_ref, "--text", typed_text)
+    clicked = run_cli("click", "--session", session, "--headless", "--ref", button_ref)
+    snapshot = run_cli("snapshot", "--session", session, "--headless")
+    return {
+        "opened": opened,
+        "button_match": button_match,
+        "input_match": input_match,
+        "button_ref": button_ref,
+        "input_ref": input_ref,
+        "typed": typed,
+        "clicked": clicked,
+        "snapshot": snapshot,
+    }
+
+
+def run_public_smoke_workflow(session: str, url: str = "https://example.com") -> dict:
+    opened = run_cli("open", url, "--session", session, "--headless")
+    found = run_cli("find", "--session", session, "--headless", "--locator", "tag:a")
+    ref = found["data"]["elements"][0]["ref"]
+    clicked = run_cli("click", "--session", session, "--headless", "--ref", ref)
+    return {
+        "opened": opened,
+        "found": found,
+        "ref": ref,
+        "clicked": clicked,
+    }
 
 
 def unique_session(prefix: str) -> str:
