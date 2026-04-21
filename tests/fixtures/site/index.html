@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>DrissionPage CLI Fixture</title>
+    <style>
+      body { font-family: sans-serif; margin: 2rem; line-height: 1.5; }
+      main { max-width: 48rem; }
+      .stack { display: grid; gap: 1rem; }
+      .panel { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; }
+      button, input, textarea, a { font-size: 1rem; }
+      #status { font-weight: bold; }
+    </style>
+  </head>
+  <body>
+    <main class="stack">
+      <h1>DrissionPage CLI Fixture</h1>
+      <p>Use this page to validate open, find, click, type, and snapshot workflows.</p>
+
+      <section class="panel stack">
+        <label for="name-input">Name</label>
+        <input id="name-input" name="name" placeholder="Type your name" />
+        <textarea id="notes-input" name="notes" placeholder="Optional notes"></textarea>
+        <button id="primary-action" type="button">Primary Action</button>
+        <a id="toggle-link" href="#status">Toggle Status</a>
+      </section>
+
+      <section class="panel stack">
+        <div id="status">Idle</div>
+        <div id="output">No submission yet.</div>
+      </section>
+    </main>
+
+    <script>
+      const button = document.getElementById('primary-action');
+      const link = document.getElementById('toggle-link');
+      const input = document.getElementById('name-input');
+      const status = document.getElementById('status');
+      const output = document.getElementById('output');
+      let clicks = 0;
+
+      button.addEventListener('click', () => {
+        clicks += 1;
+        button.textContent = `Clicked ${clicks}`;
+        output.textContent = input.value ? `Hello ${input.value}` : 'Hello anonymous';
+      });
+
+      link.addEventListener('click', (event) => {
+        event.preventDefault();
+        status.textContent = status.textContent === 'Idle' ? 'Active' : 'Idle';
+      });
+    </script>
+  </body>
+</html>
+
