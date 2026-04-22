@@ -64,12 +64,17 @@ class SnapshotNodeRecord:
     checked: bool = False
     selected: bool = False
     expanded: bool = False
+    kind: str = ""
+    group_ref: str | None = None
+    item_ref: str | None = None
+    fingerprint: str = ""
+    locator_candidates: list[str] = field(default_factory=list)
 
     def locator(self) -> str:
         return f"xpath:{self.xpath}"
 
     def to_output(self, ref: str) -> dict:
-        return {
+        result = {
             "ref": ref,
             "ref_type": self.ref_type,
             "id": self.element_id,
@@ -97,6 +102,17 @@ class SnapshotNodeRecord:
                 "expanded": self.expanded,
             },
         }
+        if self.kind:
+            result["kind"] = self.kind
+        if self.group_ref:
+            result["group_ref"] = self.group_ref
+        if self.item_ref:
+            result["item_ref"] = self.item_ref
+        if self.fingerprint:
+            result["fingerprint"] = self.fingerprint
+        if self.locator_candidates:
+            result["locator_candidates"] = self.locator_candidates
+        return result
 
 
 @dataclass
@@ -109,9 +125,36 @@ class SnapshotArtifact:
     depth: int | None
     nodes: list[dict]
     planner_view: dict | None = None
+    schema_version: str = "0.4"
+    groups: list[dict] = field(default_factory=list)
+    recovery: dict = field(default_factory=dict)
 
     def to_output(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class GroupRecord:
+    group_ref: str
+    group_kind: str
+    name: str
+    item_refs: list[str] = field(default_factory=list)
+    item_count: int = 0
+    sample_fields: list[str] = field(default_factory=list)
+    entry_action_refs: list[str] = field(default_factory=list)
+    next_page_ref: str | None = None
+    schema_hints: dict = field(default_factory=dict)
+
+
+@dataclass
+class RecoveryInfo:
+    expand_candidates: list[str] = field(default_factory=list)
+    offscreen_actionable_count: int = 0
+    truncated_regions: list[str] = field(default_factory=list)
+    truncation_reason: str | None = None
+    truncation_threshold: int | None = None
+    total_nodes: int = 0
+    truncated: bool = False
 
 
 @dataclass

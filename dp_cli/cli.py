@@ -20,7 +20,9 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_parser = subparsers.add_parser("snapshot", help="Return a structured page snapshot.")
     snapshot_parser.add_argument("ref", nargs="?")
     snapshot_parser.add_argument("--depth", type=int)
-    snapshot_parser.add_argument("--view", choices=("planner", "full"), default="planner")
+    snapshot_parser.add_argument("--view", choices=("planner", "full"), default=None,
+                                 help="Deprecated: use --mode instead.")
+    snapshot_parser.add_argument("--mode", choices=("full", "agent_summary", "extract"), default="agent_summary")
     _add_common_args(snapshot_parser)
 
     find_parser = subparsers.add_parser("find", help="Find elements by locator or text.")
@@ -75,6 +77,10 @@ def dispatch(args: argparse.Namespace, service: CliService) -> dict[str, Any]:
     if args.command == "open":
         return success(args.session, "open", service.open_page(args.url, session=args.session, headless=args.headless))
     if args.command == "snapshot":
+        view = getattr(args, "view", None)
+        mode = getattr(args, "mode", "agent_summary")
+        if view is not None:
+            mode = "full" if view == "full" else "agent_summary"
         return success(
             args.session,
             "snapshot",
@@ -82,7 +88,7 @@ def dispatch(args: argparse.Namespace, service: CliService) -> dict[str, Any]:
                 session=args.session,
                 ref=getattr(args, "ref", None),
                 depth=getattr(args, "depth", None),
-                view=getattr(args, "view", "planner"),
+                mode=mode,
                 headless=args.headless,
             ),
         )

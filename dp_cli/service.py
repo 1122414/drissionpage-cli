@@ -81,10 +81,13 @@ class CliService:
         ref: str | None = None,
         depth: int | None = None,
         headless: bool | None = None,
-        view: str = "planner",
+        view: str | None = None,
+        mode: str = "agent_summary",
     ) -> dict:
-        if view not in {"planner", "full"}:
-            raise InvalidInputError("snapshot --view must be either 'planner' or 'full'.")
+        if view is not None:
+            mode = "full" if view == "full" else "agent_summary"
+        if mode not in {"full", "agent_summary", "extract"}:
+            raise InvalidInputError("snapshot --mode must be one of: full, agent_summary, extract.")
 
         snapshot_depth = depth if depth is not None else (SNAPSHOT_DEFAULT_DEPTH if ref else None)
         scope = "subtree" if ref else "page"
@@ -102,9 +105,10 @@ class CliService:
             planner_view = self._build_planner_view(nodes)
 
             payload = {
+                "schema_version": "0.5",
+                "mode": mode,
                 "page": self._page_payload(runtime),
                 "page_identity": self._page_identity_payload(runtime),
-                "mode": "semantic",
                 "scope": scope,
                 "root_ref": root_ref,
                 "depth": snapshot_depth,
@@ -114,23 +118,28 @@ class CliService:
                 artifact=SnapshotArtifact(
                     page=payload["page"],
                     page_identity=payload["page_identity"],
-                    mode="semantic",
+                    mode=mode,
                     scope=scope,
                     root_ref=root_ref,
                     depth=snapshot_depth,
                     nodes=nodes,
                     planner_view=planner_view,
+                    schema_version="0.5",
                 ),
                 snapshot_id=runtime.state.active_page.snapshot_id or "snapshot",
             )
-            runtime.remember_snapshot(artifact_file, view)
+            runtime.remember_snapshot(artifact_file, mode)
             runtime.persist()
             payload["artifact_file"] = artifact_file
 
-            if view == "full":
+            if mode == "full":
                 payload["count"] = len(nodes)
                 payload["nodes"] = nodes
+            elif mode == "agent_summary":
+                payload["summary"] = planner_view
+                payload["planner_view"] = planner_view
             else:
+                payload["summary"] = planner_view
                 payload["planner_view"] = planner_view
             return payload
 
