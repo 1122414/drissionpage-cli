@@ -1,6 +1,48 @@
-# dp-cli
+# dp_cli
 
-面向 Agent 的 DrissionPage CLI 最小实现。当前版本已经完成 MVP 和 v0.1 会话身份机制，提供稳定的基础浏览器动作闭环：
+`dp_cli` is an Agent-first CLI wrapper around DrissionPage.
+
+The current MVP focuses on a Playwright-CLI-style workflow:
+
+1. `open`
+2. `snapshot`
+3. choose a `ref` from semantic nodes
+4. `click` / `type` by `ref`
+5. re-snapshot when the page changes
+
+The key design choice is: **the main contract is semantic snapshot + ref**, not hand-written Chinese area descriptions.
+
+## Install
+
+```bash
+conda activate dp-cli
+pip install DrissionPage pytest langchain-openai
+```
+
+If you need to create the environment first:
+
+```bash
+conda create -n dp-cli python=3.11
+conda activate dp-cli
+pip install DrissionPage pytest langchain-openai
+```
+
+## Commands
+
+All commands return JSON with the same top-level shape:
+
+- `ok`
+- `session`
+- `action`
+- `data`
+- `error`
+
+Common options:
+
+- `--session`
+- `--headless`
+
+Available commands:
 
 - `open`
 - `snapshot`
@@ -9,202 +51,240 @@
 - `type`
 - `session inspect`
 
-所有命令统一输出 JSON，适合人手动调用，也适合作为 Agent 的执行边界。
+## Snapshot model
 
-## 环境准备
+`snapshot` now uses a two-layer contract:
+
+1. full-page semantic discovery
+2. a low-token planner projection
+
+By default, the CLI returns the planner projection instead of dumping every discovered node.
+
+Example:
 
 ```bash
-conda activate dp-cli
+python -m dp_cli snapshot --session demo --headless
+python -m dp_cli snapshot --session demo --headless --view full
+python -m dp_cli snapshot r5 --session demo --headless --depth 3
+python -m dp_cli snapshot r5 --session demo --headless --depth 3 --view full
 ```
 
-如果还没有创建环境：
+Snapshot payload fields:
+
+- `mode`
+  - currently always `semantic`
+- `scope`
+  - `page` or `subtree`
+- `root_ref`
+  - `null` for page snapshot
+  - a ref when expanding a subtree
+- `depth`
+- `artifact_file`
+
+Default planner view fields:
+
+- `planner_view.pinned_controls`
+  - critical controls that must never be omitted
+  - examples: navigation links, pagination controls, search / submit buttons
+- `planner_view.viewport_nodes`
+  - the most relevant nodes already in the current viewport
+- `planner_view.condensed_groups`
+  - compressed summaries for large repeated groups such as card grids
+- `planner_view.stats`
+- `planner_view.omitted_summary`
+
+Use `--view full` when you want the complete discovered node list.
+
+Each discovered node includes:
+
+- `ref`
+- `ref_type`
+  - `container` or `element`
+- `role`
+- `name`
+- `text`
+- `states`
+- `visibility`
+  - `visible`
+  - `in_viewport`
+  - `interactable_now`
+- `context`
+  - `landmark`
+  - `heading`
+  - `form`
+  - `list`
+  - `dialog`
+- `bounds`
+- `locator`
+
+Ref rules:
+
+- `r*`
+  - semantic container ref
+- `e*`
+  - interactive element ref
+
+Command rules:
+
+- `snapshot` accepts `r*` or `e*`
+- `click` / `type` only accept `e*`
+- using a container ref with `click` / `type` returns `invalid_ref_type`
+
+## Core workflow
+
+### Open a page
 
 ```bash
-conda create -n dp-cli python=3.11
-conda activate dp-cli
-pip install DrissionPage pytest
+python -m dp_cli open https://example.com --session demo --headless
 ```
 
-## 项目结构
+### Take the default planner snapshot
 
-```text
-dp_cli/
-  cli.py            # CLI 参数解析与统一 JSON 输出
-  service.py        # 命令用例编排
-  session.py        # 会话管理与浏览器恢复
-  session_store.py  # session 元数据与状态持久化
-  runtime.py        # runtime/page/ref 生命周期
-  adapter.py        # DrissionPage 适配层
-  models.py         # 数据模型与常量
-  errors.py         # 结构化错误
-tests/
-  support.py        # 测试与脚本共享工作流
-  test_cli_local.py
-  test_public_smoke.py
-scripts/
-  test_local_cli.py
-  test_public_smoke.py
+```bash
+python -m dp_cli snapshot --session demo --headless
 ```
 
-## JSON 输出约定
+### Take the full semantic discovery snapshot
 
-所有命令至少返回以下字段：
+```bash
+python -m dp_cli snapshot --session demo --headless --view full
+```
 
-- `ok`
-- `session`
-- `action`
-- `data`
-- `error`
+### Expand a container subtree
 
-失败时 `error` 会包含：
+```bash
+python -m dp_cli snapshot r5 --session demo --headless --depth 3
+python -m dp_cli snapshot r5 --session demo --headless --depth 3 --view full
+```
 
-- `code`
-- `message`
-- `details`
+### Find visible interactive elements
 
-## Session / Runtime / Page / Ref
+`find --text` now searches the full discovered page graph, not just the current viewport.
 
-当前版本会把 session 状态持久化在：
+By text:
+
+```bash
+python -m dp_cli find --session demo --headless --text "Movies"
+python -m dp_cli find --session demo --headless --text "Next page"
+```
+
+By locator:
+
+```bash
+python -m dp_cli find --session demo --headless --locator "#search-input"
+python -m dp_cli find --session demo --headless --locator "tag:a"
+```
+
+### Click by ref or locator
+
+```bash
+python -m dp_cli click --session demo --headless --ref e12
+python -m dp_cli click --session demo --headless --locator "#next-page"
+```
+
+### Type by ref or locator
+
+```bash
+python -m dp_cli type --session demo --headless --ref e11 --text "Agentic CLI"
+python -m dp_cli type --session demo --headless --locator "#search-input" --text "Agentic CLI"
+```
+
+### Inspect session state
+
+```bash
+python -m dp_cli session inspect --session demo --headless
+```
+
+## Action safety
+
+`click` and `type` do more than simple selector execution:
+
+- validate that the ref still belongs to the current runtime and page
+- reject stale refs with `ref_stale`
+- reject container refs with `invalid_ref_type`
+- verify that the target element is interactable
+- auto-scroll into view before action when needed
+- return `element_not_interactable` when the element exists but cannot be acted on
+
+## Files and storage
+
+Session state lives under:
 
 ```text
 .dpcli/sessions/<session-name>/
 ```
 
-其中：
+Snapshot artifacts live under:
 
-- `session`
-  - 用户传入的逻辑会话名，例如 `demo`
-- `session_id`
-  - session 的稳定内部标识
-- `runtime_id`
-  - 当前浏览器实例标识，用来判断是不是同一个活会话
-- `page_id`
-  - 当前页面身份
-- `snapshot_id`
-  - 当前快照代际
-- `ref`
-  - 由 `snapshot` / `find` 产出的元素引用，只在对应 runtime/page 上有效
-
-如果页面或 runtime 已经变化，旧 `ref` 会返回 `ref_stale`，而不是静默误用。
-
-## 常用选项
-
-- `--session`
-  - 指定会话名，不传时默认使用 `default`
-- `--headless`
-  - 使用无头浏览器执行
-
-通用调用形式：
-
-```bash
-python -m dp_cli <command> [args] [options]
+```text
+.dpcli/snapshots/<session-name>/
 ```
 
-## 命令示例
+## Scripts
 
-### open
-
-```bash
-python -m dp_cli open https://example.com
-python -m dp_cli open https://example.com --session demo
-python -m dp_cli open https://example.com --session demo --headless
-```
-
-### snapshot
-
-```bash
-python -m dp_cli snapshot --session demo
-python -m dp_cli snapshot --session demo --headless
-```
-
-### find
-
-按 locator 查找：
-
-```bash
-python -m dp_cli find --session demo --locator "#name-input"
-python -m dp_cli find --session demo --locator "tag:a"
-```
-
-按文本查找：
-
-```bash
-python -m dp_cli find --session demo --text "Primary Action"
-python -m dp_cli find --session demo --headless --text "Learn more"
-```
-
-### click
-
-先查找再点击：
-
-```bash
-python -m dp_cli find --session demo --headless --text "Primary Action"
-python -m dp_cli click --session demo --headless --ref e1
-```
-
-直接按 locator 点击：
-
-```bash
-python -m dp_cli click --session demo --locator "#primary-action"
-python -m dp_cli click --session demo --headless --locator "tag:a"
-```
-
-### type
-
-先查找再输入：
-
-```bash
-python -m dp_cli find --session demo --headless --locator "#name-input"
-python -m dp_cli type --session demo --headless --ref e1 --text "Agentic CLI"
-```
-
-直接按 locator 输入：
-
-```bash
-python -m dp_cli type --session demo --locator "#name-input" --text "hello"
-python -m dp_cli type --session demo --headless --locator "#name-input" --text "typed in headless mode"
-```
-
-### session inspect
-
-```bash
-python -m dp_cli session inspect --session demo
-python -m dp_cli session inspect --session demo --headless
-```
-
-## 手工 smoke 入口
-
-`scripts/` 保留为人工执行入口，但真实流程只维护一份，复用的是 `tests/support.py` 里的共享 workflow。
-
-本地闭环：
+Local semantic workflow smoke test:
 
 ```bash
 python scripts/test_local_cli.py
 ```
 
-公网 smoke：
+Public smoke test:
 
 ```bash
 python scripts/test_public_smoke.py
 ```
 
-## 测试
+Minimal natural-language agent loop:
 
-本地回归：
+```bash
+python scripts/test_min_agent_loop.py
+```
+
+Before running the agent loop script, fill these fields in [scripts/test_min_agent_loop.py](/E:/GitHub/Repositories/drissionpage-cli/scripts/test_min_agent_loop.py:20):
+
+- `OPENAI_CONFIG["api_key"]`
+- `OPENAI_CONFIG["base_url"]`
+- `OPENAI_CONFIG["model"]`
+
+The script uses `langchain_openai.ChatOpenAI` and drives `dp_cli` through:
+
+- planner snapshot
+- ref selection
+- `find --text` fallback when the planner view does not expose the target yet
+- `click` / `type`
+
+## Tests
+
+Run local regression tests:
 
 ```bash
 pytest -q tests/test_cli_local.py
-```
-
-全部测试：
-
-```bash
 pytest -q tests
 ```
 
-启用公网 smoke：
+Enable public smoke tests explicitly:
 
 ```bash
 set DPCLI_RUN_PUBLIC_SMOKE=1
 pytest -q tests/test_public_smoke.py
 ```
+
+## Current scope
+
+This version intentionally focuses on the minimum reliable contract for agents:
+
+- semantic snapshot
+- planner projection with pinned controls
+- ref-driven interaction
+- stable session identity
+- stale ref detection
+- full-page find fallback
+- visible/interactable execution safety
+
+Not implemented yet:
+
+- `wait`
+- `inspect`
+- `screenshot`
+- `press`
+- visual understanding as the main interaction path

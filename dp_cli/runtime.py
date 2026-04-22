@@ -28,8 +28,12 @@ class RuntimeContext(AbstractContextManager):
             self.state.runtime_id = self.meta.runtime_id
             self.state.last_tab_id = None
             self.state.active_page = ActivePage()
-            self.state.refs = {}
-            self.state.next_ref_index = 1
+            self.state.container_refs = {}
+            self.state.element_refs = {}
+            self.state.next_container_index = 1
+            self.state.next_element_index = 1
+            self.state.last_snapshot_file = None
+            self.state.last_snapshot_mode = None
         elif not self.state.runtime_id:
             self.state.runtime_id = self.meta.runtime_id
         self.meta.browser_pid = current_pid
@@ -67,39 +71,68 @@ class RuntimeContext(AbstractContextManager):
         self.manager.save_meta(self.meta)
         self.manager.save_state(self.state)
 
-    def upsert_refs(self, records) -> list[dict]:
+    def upsert_nodes(self, records) -> list[dict]:
         active_page = self.state.active_page
-        xpath_to_ref = {
-            item.get("xpath"): ref
-            for ref, item in self.state.refs.items()
-            if (
-                isinstance(item, dict)
-                and item.get("xpath")
-                and item.get("runtime_id") == self.meta.runtime_id
-                and item.get("page_id") == active_page.page_id
-            )
+        refs_by_type = {
+            "container": self.state.container_refs,
+            "element": self.state.element_refs,
         }
-        payloads = []
+        next_index_attr = {
+            "container": "next_container_index",
+            "element": "next_element_index",
+        }
+        prefix = {
+            "container": "r",
+            "element": "e",
+        }
+        xpath_to_ref = {}
+        for ref_map in refs_by_type.values():
+            for ref, item in ref_map.items():
+                if (
+                    isinstance(item, dict)
+                    and item.get("xpath")
+                    and item.get("runtime_id") == self.meta.runtime_id
+                    and item.get("page_id") == active_page.page_id
+                ):
+                    xpath_to_ref[item["xpath"]] = ref
+
+        assigned: list[tuple[object, str]] = []
         for record in records:
             ref = xpath_to_ref.get(record.xpath)
             if ref is None:
-                ref = f"e{self.state.next_ref_index}"
-                self.state.next_ref_index += 1
+                attr = next_index_attr[record.ref_type]
+                ref = f"{prefix[record.ref_type]}{getattr(self.state, attr)}"
+                setattr(self.state, attr, getattr(self.state, attr) + 1)
+                xpath_to_ref[record.xpath] = ref
+            assigned.append((record, ref))
+
+        payloads = []
+        for record, ref in assigned:
             item = record.to_output(ref)
+            item["xpath"] = record.xpath
+            item["parent_ref"] = xpath_to_ref.get(record.parent_xpath) if record.parent_xpath else None
+            item["parent_xpath"] = record.parent_xpath
             item["session_id"] = self.meta.session_id
             item["runtime_id"] = self.meta.runtime_id
             item["page_id"] = active_page.page_id
             item["snapshot_id"] = active_page.snapshot_id
             item["url"] = active_page.url
-            self.state.refs[ref] = item
+            refs_by_type[record.ref_type][ref] = item
             payloads.append(item)
         return payloads
 
+    def remember_snapshot(self, artifact_file: str, mode: str) -> None:
+        self.state.last_snapshot_file = artifact_file
+        self.state.last_snapshot_mode = mode
+
     def ref_item(self, ref: str) -> dict:
-        item = self.state.refs.get(ref)
+        item = self.state.container_refs.get(ref) or self.state.element_refs.get(ref)
         if not item:
             raise KeyError(ref)
         return item
+
+    def total_ref_count(self) -> int:
+        return len(self.state.container_refs) + len(self.state.element_refs)
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.persist()

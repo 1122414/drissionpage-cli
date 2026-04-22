@@ -22,6 +22,11 @@ class ElementNotFoundError(CliError):
         super().__init__("element_not_found", message, details, exit_code=3)
 
 
+class ElementNotInteractableError(CliError):
+    def __init__(self, message: str, details: dict | None = None) -> None:
+        super().__init__("element_not_interactable", message, details, exit_code=8)
+
+
 class InvalidInputError(CliError):
     def __init__(self, message: str, details: dict | None = None) -> None:
         super().__init__("invalid_input", message, details, exit_code=4)
@@ -42,4 +47,14 @@ class RefStaleError(CliError):
             f"Element ref '{ref}' is stale for the current runtime or page. Re-run snapshot or find first.",
             payload,
             exit_code=6,
+        )
+
+
+class InvalidRefTypeError(CliError):
+    def __init__(self, ref: str, expected: str, actual: str) -> None:
+        super().__init__(
+            "invalid_ref_type",
+            f"Ref '{ref}' is a {actual} ref, but this command requires a {expected} ref.",
+            {"ref": ref, "expected": expected, "actual": actual},
+            exit_code=7,
         )

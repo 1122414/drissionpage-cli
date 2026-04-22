@@ -85,7 +85,7 @@ class SessionStore:
             for meta_file in sessions_root.glob("*/meta.json"):
                 data = read_json(meta_file, {})
                 port = data.get("port")
-                if isinstance(port, int):
+                if isinstance(port, int) and port_is_listening(port):
                     used_ports.add(port)
 
         for port in range(DEFAULT_PORT_START, DEFAULT_PORT_END + 1):
@@ -131,7 +131,16 @@ class SessionStore:
 
     def load_state(self, session: str = DEFAULT_SESSION) -> SessionState:
         paths = self.session_paths(session)
-        data = read_json(paths.state_file, {"session": session, "refs": {}, "next_ref_index": 1})
+        data = read_json(
+            paths.state_file,
+            {
+                "session": session,
+                "container_refs": {},
+                "element_refs": {},
+                "next_container_index": 1,
+                "next_element_index": 1,
+            },
+        )
         data.setdefault("session", session)
         data.setdefault("session_id", "")
         data.setdefault("runtime_id", "")
@@ -146,8 +155,24 @@ class SessionStore:
         active_page.setdefault("snapshot_id", None)
         active_page.setdefault("snapshot_seq", 0)
         data["active_page"] = ActivePage(**active_page)
-        data.setdefault("refs", {})
-        data.setdefault("next_ref_index", 1)
+        if "refs" in data and "element_refs" not in data:
+            data["element_refs"] = data.get("refs", {})
+        if "next_ref_index" in data and "next_element_index" not in data:
+            data["next_element_index"] = data.get("next_ref_index", 1)
+        if "region_refs" in data and "container_refs" not in data:
+            data["container_refs"] = data.get("region_refs", {})
+        if "next_region_index" in data and "next_container_index" not in data:
+            data["next_container_index"] = data.get("next_region_index", 1)
+        data.setdefault("container_refs", {})
+        data.setdefault("element_refs", {})
+        data.setdefault("next_container_index", 1)
+        data.setdefault("next_element_index", 1)
+        data.setdefault("last_snapshot_file", None)
+        data.setdefault("last_snapshot_mode", None)
+        data.pop("refs", None)
+        data.pop("next_ref_index", None)
+        data.pop("region_refs", None)
+        data.pop("next_region_index", None)
         return SessionState(**data)
 
     def save_meta(self, meta: SessionMeta) -> None:

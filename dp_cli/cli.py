@@ -18,6 +18,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_args(open_parser)
 
     snapshot_parser = subparsers.add_parser("snapshot", help="Return a structured page snapshot.")
+    snapshot_parser.add_argument("ref", nargs="?")
+    snapshot_parser.add_argument("--depth", type=int)
+    snapshot_parser.add_argument("--view", choices=("planner", "full"), default="planner")
     _add_common_args(snapshot_parser)
 
     find_parser = subparsers.add_parser("find", help="Find elements by locator or text.")
@@ -72,7 +75,17 @@ def dispatch(args: argparse.Namespace, service: CliService) -> dict[str, Any]:
     if args.command == "open":
         return success(args.session, "open", service.open_page(args.url, session=args.session, headless=args.headless))
     if args.command == "snapshot":
-        return success(args.session, "snapshot", service.snapshot_page(session=args.session, headless=args.headless))
+        return success(
+            args.session,
+            "snapshot",
+            service.snapshot_page(
+                session=args.session,
+                ref=getattr(args, "ref", None),
+                depth=getattr(args, "depth", None),
+                view=getattr(args, "view", "planner"),
+                headless=args.headless,
+            ),
+        )
     if args.command == "find":
         return success(
             args.session,

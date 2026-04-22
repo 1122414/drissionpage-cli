@@ -2,54 +2,242 @@
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <title>DrissionPage CLI Fixture</title>
+    <title>dp_cli Fixture</title>
     <style>
-      body { font-family: sans-serif; margin: 2rem; line-height: 1.5; }
-      main { max-width: 48rem; }
-      .stack { display: grid; gap: 1rem; }
-      .panel { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; }
-      button, input, textarea, a { font-size: 1rem; }
-      #status { font-weight: bold; }
+      :root {
+        font-family: sans-serif;
+        color: #1f2937;
+        background: #f5f7fb;
+      }
+      body {
+        margin: 0;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 240px 1fr;
+        min-height: 100vh;
+      }
+      aside[role="navigation"] {
+        background: #fff;
+        border-right: 1px solid #e5e7eb;
+        padding: 1.5rem 1rem;
+      }
+      nav ul {
+        list-style: none;
+        padding: 0;
+        margin: 1rem 0 0;
+        display: grid;
+        gap: 0.75rem;
+      }
+      nav a {
+        display: block;
+        padding: 0.75rem 1rem;
+        border-radius: 12px;
+        text-decoration: none;
+        color: #111827;
+        background: #f8fafc;
+      }
+      .content {
+        padding: 1.5rem 2rem;
+      }
+      header[role="banner"] {
+        display: grid;
+        gap: 1rem;
+      }
+      .topbar {
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+        justify-content: space-between;
+      }
+      form[role="search"] {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        background: #fff;
+        border: 1px solid #dbe3f0;
+        border-radius: 18px;
+        padding: 0.9rem 1rem;
+        max-width: 760px;
+      }
+      input,
+      button {
+        font: inherit;
+      }
+      #search-input {
+        flex: 1;
+        border: none;
+        outline: none;
+        background: transparent;
+      }
+      .ghost-button {
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        padding: 0.35rem 0.5rem;
+        border-radius: 10px;
+      }
+      .pill-button {
+        border: none;
+        background: #eef2ff;
+        color: #4338ca;
+        padding: 0.45rem 0.8rem;
+        border-radius: 999px;
+        cursor: pointer;
+      }
+      [role="complementary"] {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+      .avatar-button {
+        border: none;
+        width: 42px;
+        height: 42px;
+        border-radius: 999px;
+        background: #fff;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+        cursor: pointer;
+      }
+      main[role="main"] {
+        margin-top: 1.5rem;
+        display: grid;
+        gap: 1rem;
+      }
+      .card-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 1rem;
+      }
+      .card-grid a {
+        display: block;
+        padding: 1rem;
+        min-height: 220px;
+        border-radius: 18px;
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        color: inherit;
+        text-decoration: none;
+      }
+      .status-panel {
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 18px;
+        padding: 1rem;
+        display: grid;
+        gap: 0.75rem;
+      }
+      .section-title {
+        margin: 0;
+        font-size: 1.25rem;
+      }
     </style>
   </head>
   <body>
-    <main class="stack">
-      <h1>DrissionPage CLI Fixture</h1>
-      <p>Use this page to validate open, find, click, type, and snapshot workflows.</p>
+    <div class="layout">
+      <aside aria-label="Sidebar">
+        <strong>dp_cli Fixture</strong>
+        <nav aria-label="Sections">
+          <ul>
+            <li><a href="#home">Home</a></li>
+            <li><a href="#shows">Shows</a></li>
+            <li><a href="#anime">Anime</a></li>
+            <li><a id="movies-link" href="#movies">Movies</a></li>
+          </ul>
+        </nav>
+      </aside>
 
-      <section class="panel stack">
-        <label for="name-input">Name</label>
-        <input id="name-input" name="name" placeholder="Type your name" />
-        <textarea id="notes-input" name="notes" placeholder="Optional notes"></textarea>
-        <button id="primary-action" type="button">Primary Action</button>
-        <a id="toggle-link" href="#status">Toggle Status</a>
-      </section>
+      <div class="content">
+        <header role="banner" aria-label="Top bar">
+          <div class="topbar">
+            <form id="search-region" role="search" aria-label="Search">
+              <label for="search-input">Search</label>
+              <input id="search-input" name="query" placeholder="Search titles" aria-label="Search input">
+              <button id="hot-button" class="pill-button" type="button">Hot</button>
+              <button
+                id="search-button"
+                class="ghost-button icon-search"
+                type="button"
+                aria-label="Search"
+                title="Search"
+              >
+                Search
+              </button>
+            </form>
 
-      <section class="panel stack">
-        <div id="status">Idle</div>
-        <div id="output">No submission yet.</div>
-      </section>
-    </main>
+            <section role="complementary" aria-label="User menu">
+              <span>Watch history</span>
+              <button id="user-button" class="avatar-button" type="button" aria-label="User menu" title="User menu">
+                U
+              </button>
+            </section>
+          </div>
+        </header>
+
+        <main role="main" aria-label="Featured content">
+          <h1 class="section-title">Featured Movies</h1>
+
+          <section aria-labelledby="movie-cards-heading">
+            <h2 id="movie-cards-heading">Movie cards</h2>
+            <div class="card-grid">
+              <a href="#cloud">Clouds Over the City</a>
+              <a href="#gold">Golden Case</a>
+              <a href="#honey">Honey Chronicle</a>
+              <a href="#forest">Forest Signal</a>
+              <a href="#sailing">Sailing Under Rain</a>
+              <a href="#winter">Winter Train Station</a>
+              <a href="#archive">Archive of Echoes</a>
+              <a href="#night">Night Harbor</a>
+              <a href="#flame">Flame in the Corridor</a>
+              <a href="#mirror">Mirror House</a>
+              <a href="#silent">Silent Theater</a>
+              <a href="#dust">Dust Over the River</a>
+              <a href="#ember">Ember Avenue</a>
+              <a href="#signal">Signal Room</a>
+              <a href="#island">Island of Glass</a>
+              <a href="#arrival">Arrival Platform</a>
+              <a href="#summer">Summer Code</a>
+              <a href="#arcade">Arcade Shadows</a>
+            </div>
+          </section>
+
+          <section class="status-panel" aria-labelledby="search-status-heading">
+            <h2 id="search-status-heading">Search status</h2>
+            <div id="search-status">Idle</div>
+            <div id="page-counter">Page 1</div>
+            <button id="next-page" type="button" aria-label="Next page">Next page</button>
+          </section>
+        </main>
+      </div>
+    </div>
 
     <script>
-      const button = document.getElementById('primary-action');
-      const link = document.getElementById('toggle-link');
-      const input = document.getElementById('name-input');
-      const status = document.getElementById('status');
-      const output = document.getElementById('output');
-      let clicks = 0;
+      const searchInput = document.getElementById("search-input");
+      const searchButton = document.getElementById("search-button");
+      const hotButton = document.getElementById("hot-button");
+      const searchStatus = document.getElementById("search-status");
+      const pageCounter = document.getElementById("page-counter");
+      const nextPageButton = document.getElementById("next-page");
+      const moviesLink = document.getElementById("movies-link");
+      let currentPage = 1;
 
-      button.addEventListener('click', () => {
-        clicks += 1;
-        button.textContent = `Clicked ${clicks}`;
-        output.textContent = input.value ? `Hello ${input.value}` : 'Hello anonymous';
+      searchButton.addEventListener("click", () => {
+        const query = searchInput.value.trim() || "empty";
+        searchStatus.textContent = `Searching: ${query}`;
+        hotButton.textContent = "Searched";
+        searchButton.setAttribute("aria-label", "Search complete");
+        searchButton.setAttribute("title", "Search complete");
       });
 
-      link.addEventListener('click', (event) => {
+      nextPageButton.addEventListener("click", () => {
+        currentPage += 1;
+        pageCounter.textContent = `Page ${currentPage}`;
+      });
+
+      moviesLink.addEventListener("click", (event) => {
         event.preventDefault();
-        status.textContent = status.textContent === 'Idle' ? 'Active' : 'Idle';
+        searchStatus.textContent = "Movies opened";
       });
     </script>
   </body>
 </html>
-

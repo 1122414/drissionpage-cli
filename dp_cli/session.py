@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import time
 from pathlib import Path
 
 from DrissionPage import Chromium, ChromiumOptions
@@ -47,6 +48,15 @@ class SessionManager:
             return False
 
     def _restore_tab(self, browser, state: SessionState):
+        saved_tab_id = state.last_tab_id
+        if saved_tab_id and saved_tab_id in set(getattr(browser, "tab_ids", [])):
+            try:
+                tab = browser.get_tab(saved_tab_id)
+                if self._tab_is_usable(tab):
+                    return tab
+            except Exception:
+                pass
+
         # Prefer tabs that the live browser currently exposes instead of trusting
         # a persisted tab id from a previous browser lifecycle.
         try:
@@ -70,8 +80,17 @@ class SessionManager:
         state = self.load_state(session=session)
         if not state.session_id:
             state.session_id = meta.session_id
-        browser = Chromium(self._build_options(meta))
-        tab = self._restore_tab(browser, state)
+        last_error = None
+        for _ in range(2):
+            try:
+                browser = Chromium(self._build_options(meta))
+                tab = self._restore_tab(browser, state)
+                break
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.5)
+        else:
+            raise last_error  # type: ignore[misc]
         ctx = RuntimeContext(self, meta, state, browser, tab)
         ctx.sync_runtime_identity()
         ctx.sync_page_identity()
