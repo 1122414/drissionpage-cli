@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 
 from dp_cli.adapter import DrissionPageAdapter
+from dp_cli.compressor import CompressionConfig, DOMCompressor
 from dp_cli.errors import (
     ElementNotFoundError,
     ElementNotInteractableError,
@@ -102,7 +103,8 @@ class CliService:
 
             records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=root_xpath, depth=snapshot_depth)
             nodes = runtime.upsert_nodes(records)
-            planner_view = self._build_planner_view(nodes)
+            compressed_groups = self._compress_nodes(nodes)
+            planner_view = self._build_planner_view(nodes, compressed_groups)
 
             payload = {
                 "schema_version": "0.5",
@@ -344,7 +346,11 @@ class CliService:
         path.write_text(json.dumps(artifact.to_output(), ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)
 
-    def _build_planner_view(self, nodes: list[dict]) -> dict:
+    def _compress_nodes(self, nodes: list[dict]) -> list[dict]:
+        compressor = DOMCompressor(CompressionConfig(min_group_size=3))
+        return compressor.compress(nodes)
+
+    def _build_planner_view(self, nodes: list[dict], compressed_groups: list | None = None) -> dict:
         lookup = {node["ref"]: node for node in nodes}
         children = self._children_map(nodes)
 
@@ -359,38 +365,54 @@ class CliService:
 
         condensed_groups: list[dict] = []
         condensed_member_refs: set[str] = set()
-        candidate_groups: list[tuple[dict, list[dict]]] = []
-        for node in nodes:
-            if node["ref_type"] != "container":
-                continue
-            descendants = self._descendant_elements(node["ref"], children)
-            if not self._is_condensable_group(node, lookup, children, descendants):
-                continue
-            if not descendants:
-                continue
-            candidate_groups.append((node, descendants))
 
-        if not candidate_groups:
-            fallback_groups = []
+
+        if compressed_groups:
+            for cg in compressed_groups:
+                condensed_groups.append({
+                    "ref": cg.representative_ref,
+                    "ref_type": "container",
+                    "role": cg.role,
+                    "compressed": True,
+                    "count": cg.count,
+                    "member_refs": cg.member_refs,
+                    "xpath_template": cg.xpath_template,
+                })
+                for ref in cg.member_refs:
+                    condensed_member_refs.add(ref)
+        else:
+            candidate_groups: list[tuple[dict, list[dict]]] = []
             for node in nodes:
                 if node["ref_type"] != "container":
                     continue
                 descendants = self._descendant_elements(node["ref"], children)
-                if len(descendants) < 6:
+                if not self._is_condensable_group(node, lookup, children, descendants):
                     continue
-                if node["role"] in {"banner", "complementary", "contentinfo", "dialog", "form", "navigation", "search"}:
+                if not descendants:
                     continue
-                if sum(1 for item in descendants if self._is_pinned_control(item, lookup, children)) >= 3:
-                    continue
-                fallback_groups.append((node, descendants))
-            fallback_groups.sort(key=lambda item: len(item[1]), reverse=True)
-            candidate_groups = fallback_groups[:1]
+                candidate_groups.append((node, descendants))
 
-        for node, descendants in candidate_groups:
-            condensed_groups.append(self._group_summary(node, descendants))
-            for descendant in descendants:
-                if descendant["ref"] not in pinned_refs:
-                    condensed_member_refs.add(descendant["ref"])
+            if not candidate_groups:
+                fallback_groups = []
+                for node in nodes:
+                    if node["ref_type"] != "container":
+                        continue
+                    descendants = self._descendant_elements(node["ref"], children)
+                    if len(descendants) < 6:
+                        continue
+                    if node["role"] in {"banner", "complementary", "contentinfo", "dialog", "form", "navigation", "search"}:
+                        continue
+                    if sum(1 for item in descendants if self._is_pinned_control(item, lookup, children)) >= 3:
+                        continue
+                    fallback_groups.append((node, descendants))
+                fallback_groups.sort(key=lambda item: len(item[1]), reverse=True)
+                candidate_groups = fallback_groups[:1]
+
+            for node, descendants in candidate_groups:
+                condensed_groups.append(self._group_summary(node, descendants))
+                for descendant in descendants:
+                    if descendant["ref"] not in pinned_refs:
+                        condensed_member_refs.add(descendant["ref"])
 
         viewport_nodes: list[dict] = []
         for node in nodes:
@@ -408,7 +430,7 @@ class CliService:
             | {item["ref"] for item in condensed_groups}
         )
         omitted_nodes = [node for node in nodes if node["ref"] not in surfaced_refs]
-        return {
+        result = {
             "pinned_controls": pinned_controls,
             "viewport_nodes": viewport_nodes,
             "condensed_groups": condensed_groups,
@@ -426,6 +448,10 @@ class CliService:
                 "omitted_container_count": sum(1 for node in omitted_nodes if node["ref_type"] == "container"),
             },
         }
+
+        if compressed_groups:
+            result["compressed_groups_count"] = len(compressed_groups)
+        return result
 
     def _filter_text_matches(self, nodes: list[dict], query: str) -> list[dict]:
         lookup = {node["ref"]: node for node in nodes}
