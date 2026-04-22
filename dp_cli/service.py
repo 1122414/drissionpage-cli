@@ -121,6 +121,9 @@ class CliService:
                 "root_ref": root_ref,
                 "depth": snapshot_depth,
             }
+            from dataclasses import asdict
+            groups_data = [asdict(g) for g in compressed_groups] if compressed_groups else []
+            recovery_data = asdict(recovery) if recovery else {}
             artifact_file = self._write_snapshot_artifact(
                 session=session,
                 artifact=SnapshotArtifact(
@@ -133,6 +136,8 @@ class CliService:
                     nodes=nodes,
                     planner_view=planner_view,
                     schema_version="0.5",
+                    groups=groups_data,
+                    recovery=recovery_data,
                 ),
                 snapshot_id=runtime.state.active_page.snapshot_id or "snapshot",
             )
@@ -143,15 +148,15 @@ class CliService:
             if mode == "full":
                 payload["count"] = len(nodes)
                 payload["nodes"] = nodes
-                payload["groups"] = compressed_groups
-                payload["recovery"] = recovery
+                payload["groups"] = groups_data
+                payload["recovery"] = recovery_data
             elif mode == "agent_summary":
                 payload["summary"] = {
                     "global_actions": agent_summary.global_actions,
                     "visible_focus": agent_summary.visible_focus,
                     "repeated_regions": agent_summary.repeated_regions,
                 }
-                payload["recovery"] = recovery
+                payload["recovery"] = recovery_data
                 payload["planner_view"] = planner_view
             else:
                 payload["summary"] = planner_view
