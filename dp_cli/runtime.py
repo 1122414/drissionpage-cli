@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 
+from dp_cli.fingerprint import FingerprintIndex, NodeFingerprint
+from dp_cli.locator import LocatorGenerator
 from dp_cli.models import ActivePage
 from dp_cli.session_store import new_id, utc_now
 
@@ -13,6 +15,8 @@ class RuntimeContext(AbstractContextManager):
         self.state = state
         self.browser = browser
         self.tab = tab
+        self.fingerprint_index = FingerprintIndex()
+        self.locator_generator = LocatorGenerator()
 
     def current_page_info(self) -> dict:
         return {
@@ -106,6 +110,7 @@ class RuntimeContext(AbstractContextManager):
                 xpath_to_ref[record.xpath] = ref
             assigned.append((record, ref))
 
+        fp_gen = NodeFingerprint()
         payloads = []
         for record, ref in assigned:
             item = record.to_output(ref)
@@ -117,6 +122,9 @@ class RuntimeContext(AbstractContextManager):
             item["page_id"] = active_page.page_id
             item["snapshot_id"] = active_page.snapshot_id
             item["url"] = active_page.url
+            item["fingerprint"] = fp_gen.compute(item)
+            item["locator_candidates"] = self.locator_generator.generate(item)
+            self.fingerprint_index.add(ref, item["fingerprint"])
             refs_by_type[record.ref_type][ref] = item
             payloads.append(item)
         return payloads
@@ -133,6 +141,9 @@ class RuntimeContext(AbstractContextManager):
 
     def total_ref_count(self) -> int:
         return len(self.state.container_refs) + len(self.state.element_refs)
+
+    def find_by_fingerprint(self, fingerprint: str) -> str | None:
+        return self.fingerprint_index.find(fingerprint)
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.persist()
