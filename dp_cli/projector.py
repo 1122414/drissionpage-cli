@@ -39,14 +39,17 @@ class SummaryProjector:
                 })
         return actions[:12]
 
-    def _select_visible_focus(self, nodes: list[dict], groups: list[dict]) -> list[dict]:
+    def _select_visible_focus(self, nodes: list[dict], groups: list) -> list[dict]:
         focus = []
         for group in groups:
+            ref = getattr(group, "representative_ref", "") or getattr(group, "ref", "")
+            name = getattr(group, "name", "") or ""
+            count = getattr(group, "count", 0) or 0
             focus.append({
-                "ref": group.get("representative_ref", group.get("ref")),
+                "ref": ref,
                 "kind": "group",
-                "name": group.get("name", ""),
-                "item_count": group.get("count", 0),
+                "name": name,
+                "item_count": count,
             })
         visible_regions = [n for n in nodes if n.get("kind") == "region" and n["visibility"]["in_viewport"]]
         for region in visible_regions[:6]:
@@ -58,13 +61,15 @@ class SummaryProjector:
             })
         return focus[:6]
 
-    def _build_repeated_regions(self, groups: list[dict]) -> list[dict]:
+    def _build_repeated_regions(self, groups: list) -> list[dict]:
         regions = []
         for group in groups:
+            ref = getattr(group, "representative_ref", "") or getattr(group, "ref", "")
+            name = getattr(group, "name", "") or ""
             regions.append({
-                "group_ref": group.get("representative_ref", group.get("ref")),
-                "group_kind": group.get("group_kind", "list"),
-                "name": group.get("name", ""),
+                "group_ref": ref,
+                "group_kind": getattr(group, "group_kind", "list") or "list",
+                "name": name,
                 "sample_item_names": [],
                 "entry_action_refs": [],
                 "next_page_ref": None,
