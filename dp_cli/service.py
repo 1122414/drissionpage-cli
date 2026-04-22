@@ -16,6 +16,7 @@ from dp_cli.errors import (
     RefStaleError,
 )
 from dp_cli.models import DEFAULT_SESSION, SNAPSHOT_DEFAULT_DEPTH, SnapshotArtifact
+from dp_cli.projector import RecoveryProjector, SummaryProjector, TokenBudgetEnforcer
 from dp_cli.session import SessionManager
 
 PAGINATION_KEYWORDS = {
@@ -104,6 +105,11 @@ class CliService:
             records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=root_xpath, depth=snapshot_depth)
             nodes = runtime.upsert_nodes(records)
             compressed_groups = self._compress_nodes(nodes)
+            summary_projector = SummaryProjector()
+            recovery_projector = RecoveryProjector()
+            budget_enforcer = TokenBudgetEnforcer()
+            base_summary = summary_projector.project(nodes, compressed_groups, recovery_projector.project(nodes))
+            agent_summary, recovery = budget_enforcer.enforce(base_summary)
             planner_view = self._build_planner_view(nodes, compressed_groups)
 
             payload = {
@@ -137,8 +143,15 @@ class CliService:
             if mode == "full":
                 payload["count"] = len(nodes)
                 payload["nodes"] = nodes
+                payload["groups"] = compressed_groups
+                payload["recovery"] = recovery
             elif mode == "agent_summary":
-                payload["summary"] = planner_view
+                payload["summary"] = {
+                    "global_actions": agent_summary.global_actions,
+                    "visible_focus": agent_summary.visible_focus,
+                    "repeated_regions": agent_summary.repeated_regions,
+                }
+                payload["recovery"] = recovery
                 payload["planner_view"] = planner_view
             else:
                 payload["summary"] = planner_view
