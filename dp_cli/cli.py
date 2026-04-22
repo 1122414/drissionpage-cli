@@ -44,6 +44,30 @@ def build_parser() -> argparse.ArgumentParser:
     target_group.add_argument("--locator")
     type_parser.add_argument("--text", required=True)
 
+    expand_parser = subparsers.add_parser("expand", help="Expand a container subtree.")
+    expand_parser.add_argument("ref")
+    expand_parser.add_argument("--depth", type=int, default=2)
+    _add_common_args(expand_parser)
+
+    list_items_parser = subparsers.add_parser("list-items", help="List items in a group.")
+    list_items_parser.add_argument("group_ref")
+    list_items_parser.add_argument("--sample-size", type=int, default=3)
+    _add_common_args(list_items_parser)
+
+    extract_parser = subparsers.add_parser("extract", help="Extract structured data from a group.")
+    extract_parser.add_argument("target_ref")
+    extract_parser.add_argument("--schema", nargs="+", default=None)
+    extract_parser.add_argument("--sample-only", action="store_true")
+    _add_common_args(extract_parser)
+
+    resolve_parser = subparsers.add_parser("resolve-locator", help="Resolve ref to locator candidates.")
+    resolve_parser.add_argument("--ref", required=True)
+    _add_common_args(resolve_parser)
+
+    eval_parser = subparsers.add_parser("eval", help="Evaluate JavaScript on the page.")
+    eval_parser.add_argument("js")
+    _add_common_args(eval_parser)
+
     session_parser = subparsers.add_parser("session", help="Inspect session runtime and page identity.")
     session_subparsers = session_parser.add_subparsers(dest="session_command", required=True)
     inspect_parser = session_subparsers.add_parser("inspect", help="Return agent-friendly session state.")
@@ -123,6 +147,60 @@ def dispatch(args: argparse.Namespace, service: CliService) -> dict[str, Any]:
                 session=args.session,
                 ref=getattr(args, "ref", None),
                 locator=getattr(args, "locator", None),
+                headless=args.headless,
+            ),
+        )
+    if args.command == "expand":
+        return success(
+            args.session,
+            "expand",
+            service.expand_container(
+                session=args.session,
+                ref=args.ref,
+                depth=args.depth,
+                headless=args.headless,
+            ),
+        )
+    if args.command == "list-items":
+        return success(
+            args.session,
+            "list-items",
+            service.list_items(
+                session=args.session,
+                group_ref=args.group_ref,
+                sample_size=args.sample_size,
+                headless=args.headless,
+            ),
+        )
+    if args.command == "extract":
+        return success(
+            args.session,
+            "extract",
+            service.extract_group(
+                session=args.session,
+                target_ref=args.target_ref,
+                schema=args.schema,
+                sample_only=args.sample_only,
+                headless=args.headless,
+            ),
+        )
+    if args.command == "resolve-locator":
+        return success(
+            args.session,
+            "resolve-locator",
+            service.resolve_locator(
+                session=args.session,
+                ref=args.ref,
+                headless=args.headless,
+            ),
+        )
+    if args.command == "eval":
+        return success(
+            args.session,
+            "eval",
+            service.eval_js(
+                session=args.session,
+                js=args.js,
                 headless=args.headless,
             ),
         )

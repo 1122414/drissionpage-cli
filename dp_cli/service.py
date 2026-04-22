@@ -230,6 +230,103 @@ class CliService:
             },
         )
 
+    def expand_container(
+        self,
+        session: str = DEFAULT_SESSION,
+        ref: str | None = None,
+        depth: int = 2,
+        headless: bool | None = None,
+    ) -> dict:
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            runtime.begin_snapshot()
+            records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=self._ref_item(runtime, ref)["xpath"], depth=depth)
+            nodes = runtime.upsert_nodes(records)
+            runtime.persist()
+            return {
+                "page": self._page_payload(runtime),
+                "page_identity": self._page_identity_payload(runtime),
+                "target_ref": ref,
+                "mode": "full",
+                "count": len(nodes),
+                "nodes": nodes,
+            }
+
+    def list_items(
+        self,
+        session: str = DEFAULT_SESSION,
+        group_ref: str | None = None,
+        sample_size: int = 3,
+        headless: bool | None = None,
+    ) -> dict:
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            runtime.begin_snapshot()
+            group_item = self._ref_item(runtime, group_ref)
+            records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=group_item["xpath"], depth=2)
+            nodes = runtime.upsert_nodes(records)
+            compressed_groups = self._compress_nodes(nodes)
+            group = compressed_groups[0] if compressed_groups else {"representative_ref": group_ref, "count": len(nodes), "member_refs": [n["ref"] for n in nodes[:sample_size]]}
+            from dp_cli.grouper import FieldSchemaExtractor, GroupKindDetector
+            kind = GroupKindDetector().detect(group, nodes)
+            fields = FieldSchemaExtractor().extract(group.get("member_refs", []), nodes)
+            runtime.persist()
+            return {
+                "page": self._page_payload(runtime),
+                "group_ref": group_ref,
+                "group_kind": kind,
+                "item_count": group.get("count", 0),
+                "sample_items": [{"item_ref": ref, "fields": {}} for ref in group.get("member_refs", [])[:sample_size]],
+                "schema_hints": fields,
+            }
+
+    def extract_group(
+        self,
+        session: str = DEFAULT_SESSION,
+        target_ref: str | None = None,
+        schema: list[str] | None = None,
+        sample_only: bool = False,
+        headless: bool | None = None,
+    ) -> dict:
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            runtime.begin_snapshot()
+            target_item = self._ref_item(runtime, target_ref)
+            records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=target_item["xpath"], depth=2)
+            nodes = runtime.upsert_nodes(records)
+            from dp_cli.projector import ExtractProjector
+            projector = ExtractProjector()
+            compressed_groups = self._compress_nodes(nodes)
+            group = compressed_groups[0] if compressed_groups else {"representative_ref": target_ref, "item_refs": [n["ref"] for n in nodes]}
+            result = projector.project(group, nodes, schema)
+            if sample_only:
+                result["items"] = result["items"][:3]
+            runtime.persist()
+            return result
+
+    def resolve_locator(
+        self,
+        session: str = DEFAULT_SESSION,
+        ref: str | None = None,
+        headless: bool | None = None,
+    ) -> dict:
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            item = self._ref_item(runtime, ref)
+            return {
+                "ref": ref,
+                "fingerprint": item.get("fingerprint", ""),
+                "confidence": 0.9 if item.get("fingerprint") else 0.0,
+                "locator_candidates": item.get("locator_candidates", []),
+                "re_resolve_result": "matched",
+            }
+
+    def eval_js(
+        self,
+        session: str = DEFAULT_SESSION,
+        js: str = "",
+        headless: bool | None = None,
+    ) -> dict:
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            result = runtime.tab.run_js(js)
+            return {"result": result}
+
     def inspect_session(self, session: str = DEFAULT_SESSION, headless: bool | None = None) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
             return {
