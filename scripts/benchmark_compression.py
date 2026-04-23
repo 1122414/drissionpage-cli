@@ -60,7 +60,6 @@ def main():
     for g in groups:
         print(f"  - {g.tag} (role={g.role}): {g.count} items, refs={g.member_refs}")
 
-    compressed_nodes = []
     compressed_refs = set()
     for g in groups:
         for ref in g.member_refs:
@@ -68,6 +67,9 @@ def main():
         for node in nodes:
             if node.get("parent_ref") in compressed_refs:
                 compressed_refs.add(node["ref"])
+
+    compressed_nodes = []
+    for g in groups:
         compressed_nodes.append({
             "ref": g.representative_ref,
             "ref_type": "container",
@@ -88,6 +90,25 @@ def main():
     if original_tokens > 0:
         savings = (original_tokens - compressed_tokens) / original_tokens * 100
         print(f"Token savings: {savings:.1f}%")
+        print(f"Nodes removed: {len(nodes) - len(compressed_nodes)}")
+
+    print("\n--- Agent Summary Projection ---")
+    summary = {
+        "global_actions": [
+            {"ref": "e100", "role": "textbox", "name": "Search"}
+        ],
+        "visible_focus": [
+            {"ref": "r2", "kind": "group", "name": "Product list", "item_count": 24}
+        ],
+        "repeated_regions": [
+            {"group_ref": "r2", "group_kind": "list", "name": "Products", "sample_item_names": ["Product 1", "Product 2", "Product 3"]}
+        ],
+    }
+    summary_tokens = count_tokens(summary)
+    print(f"Summary tokens (est.): {summary_tokens}")
+    if original_tokens > 0:
+        summary_savings = (original_tokens - summary_tokens) / original_tokens * 100
+        print(f"Summary vs original savings: {summary_savings:.1f}%")
 
 
 if __name__ == "__main__":
