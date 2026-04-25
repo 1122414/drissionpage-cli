@@ -26,6 +26,10 @@ DEFAULT_CONFIG = {
 
 # Test scenarios
 SCENARIOS = {
+    # 要添加新测试场景，在此字典中添加键值对：
+    #   "场景名": "自然语言描述的目标"
+    # 然后运行：python tests/test_agent_computor.py --scenario 场景名
+    # 或使用 --dry-run 快速查看页面 index 结构而不调用 LLM
     # "automation": "打开 https://www.baidu.com，在搜索框输入'python tutorial'，点击搜索按钮",
     # "crawler_list": "访问 https://news.ycombinator.com，提取前5条新闻的标题和链接",
     "hybrid": "去 https://www.libvio.mov/ 搜索进击的巨人，并播放第一季的第五集",
@@ -382,6 +386,38 @@ class DPCLIAgent:
             compact.append(compact_item)
         return compact
 
+    def print_index(self, snapshot: dict[str, Any]) -> None:
+        """Print a human-readable summary of the snapshot index for debugging."""
+        if not isinstance(snapshot, dict):
+            print(f"Invalid snapshot: {type(snapshot).__name__}")
+            return
+        data = snapshot.get("data") or {}
+        index = data.get("index") or {}
+        stats = index.get("stats", {})
+        print(f"\n--- Snapshot Index ---")
+        print(f"URL: {(data.get('page') or {}).get('url')}")
+        print(f"Title: {(data.get('page') or {}).get('title')}")
+        print(f"Schema: {data.get('schema_version')}")
+        print(f"Total nodes: {stats.get('total_nodes')}")
+        print(f"Surface: {stats.get('surface_count')} | Deep: {stats.get('deep_count')}")
+        print(f"In viewport: {stats.get('in_viewport')} | Offscreen: {stats.get('offscreen')}")
+        print(f"Interactable now: {stats.get('interactable_now')}")
+        interactable = index.get("interactable_elements", [])
+        if interactable:
+            print(f"\nInteractable elements ({len(interactable)}):")
+            for item in interactable[:10]:
+                print(f"  {item.get('ref')} {item.get('role'):12} {item.get('name', '')[:40]}")
+            if len(interactable) > 10:
+                print(f"  ... and {len(interactable) - 10} more")
+        surface = index.get("surface_index", [])
+        if surface:
+            print(f"\nSurface index ({len(surface)}):")
+            for item in surface[:10]:
+                print(f"  {item.get('ref')} {item.get('role'):12} {item.get('name', '')[:40]} (children: {item.get('child_count', 0)})")
+            if len(surface) > 10:
+                print(f"  ... and {len(surface) - 10} more")
+        print("---")
+
     def compact_state(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(snapshot, dict):
             return {"error": f"Unexpected snapshot format: {type(snapshot).__name__}", "raw": str(snapshot)[:200]}
@@ -462,6 +498,14 @@ class DPCLIAgent:
 
             if not result.get("ok"):
                 report.error = f"Open failed: {result.get('error')}"
+                return report
+
+            if max_steps <= 0:
+                snapshot = self.executor.snapshot(mode="agent_summary")
+                if snapshot.get("ok"):
+                    self.print_index(snapshot)
+                report.success = True
+                report.total_duration_ms = (time.time() - start_time) * 1000
                 return report
 
             # Main loop
@@ -711,7 +755,7 @@ class TestRunner:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="test_agent_computor",
-        description="Test dp_cli v0.5 capabilities with natural language commands via LangChain + OpenAI",
+        description="Test dp_cli v0.6 capabilities with natural language commands via LangChain + OpenAI",
     )
     parser.add_argument("--api-key", default=DEFAULT_CONFIG["api_key"], help="OpenAI API key")
     parser.add_argument("--base-url", default=DEFAULT_CONFIG["base_url"], help="OpenAI-compatible base URL")
@@ -721,11 +765,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=10, help="Max steps per scenario")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
     parser.add_argument("--output", help="Save results to JSON file")
+    parser.add_argument("--dry-run", action="store_true", help="Open URL and print snapshot index, then exit without LLM")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if args.dry_run:
+        goal = args.goal or SCENARIOS.get(args.scenario, "")
+        if not goal:
+            print("Error: --dry-run requires --goal or --scenario")
+            return 1
+        import re
+        url_match = re.search(r'https?://[^\s，。]+', goal)
+        url = url_match.group(0) if url_match else None
+        if not url:
+            print("Error: Could not extract URL from goal")
+            return 1
+        executor = DPCLIExecutor(session="dry-run", headless=args.headless)
+        open_result = executor.open(url)
+        if not open_result.get("ok"):
+            print(f"Open failed: {open_result.get('error')}")
+            return 1
+        snapshot = executor.snapshot(mode="agent_summary")
+        if not snapshot.get("ok"):
+            print(f"Snapshot failed: {snapshot.get('error')}")
+            return 1
+        agent = DPCLIAgent(llm=None, executor=executor)
+        agent.print_index(snapshot)
+        compact = agent.compact_state(snapshot)
+        print(f"\nCompact state keys: {list(compact.keys())}")
+        return 0
 
     if not args.api_key:
         print("Error: API key required. Set OPENAI_API_KEY or pass --api-key")
@@ -738,14 +809,12 @@ def main(argv: list[str] | None = None) -> int:
         headless=args.headless,
     )
 
-    # Run scenarios
     if args.goal:
         runner.run_scenario("custom", args.goal, args.max_steps)
     elif args.scenario:
         goal = SCENARIOS[args.scenario]
         runner.run_scenario(args.scenario, goal, args.max_steps)
     else:
-        # Run all scenarios
         for name, goal in SCENARIOS.items():
             runner.run_scenario(name, goal, args.max_steps)
 

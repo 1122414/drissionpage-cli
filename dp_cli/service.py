@@ -16,7 +16,6 @@ from dp_cli.errors import (
     RefStaleError,
 )
 from dp_cli.models import DEFAULT_SESSION, SNAPSHOT_DEFAULT_DEPTH, SnapshotArtifact
-from dp_cli.projector import RecoveryProjector, SummaryProjector, TokenBudgetEnforcer
 from dp_cli.session import SessionManager
 
 PAGINATION_KEYWORDS = {
@@ -49,20 +48,6 @@ PRIMARY_ACTION_KEYWORDS = {
     "登录",
 }
 
-SURFACE_CONTAINER_ROLES = {
-    "banner",
-    "complementary",
-    "contentinfo",
-    "dialog",
-    "form",
-    "list",
-    "main",
-    "navigation",
-    "region",
-    "search",
-    "table",
-    "toolbar",
-}
 
 
 class CliService:
@@ -470,138 +455,6 @@ class CliService:
         compressor = DOMCompressor(CompressionConfig(min_group_size=3))
         return compressor.compress(nodes)
 
-    def _build_planner_view(self, nodes: list[dict], compressed_groups: list | None = None) -> dict:
-        lookup = {node["ref"]: node for node in nodes}
-        children = self._children_map(nodes)
-        pinned_controls, pinned_refs = self._build_pinned_controls(nodes, lookup, children)
-        condensed_groups, condensed_member_refs = self._build_condensed_groups(
-            nodes, compressed_groups, lookup, children, pinned_refs
-        )
-        viewport_nodes = self._build_viewport_nodes(nodes, pinned_refs, condensed_member_refs)
-        return self._build_planner_result(nodes, pinned_controls, viewport_nodes, condensed_groups, compressed_groups)
-
-    def _build_pinned_controls(
-        self, nodes: list[dict], lookup: dict[str, dict], children: dict[str, list[dict]]
-    ) -> tuple[list[dict], set[str]]:
-        pinned_controls: list[dict] = []
-        pinned_refs: set[str] = set()
-        for node in nodes:
-            if node["ref_type"] != "element":
-                continue
-            if self._is_pinned_control(node, lookup, children):
-                pinned_controls.append(self._node_summary(node))
-                pinned_refs.add(node["ref"])
-        return pinned_controls, pinned_refs
-
-    def _build_condensed_groups(
-        self,
-        nodes: list[dict],
-        compressed_groups: list | None,
-        lookup: dict[str, dict],
-        children: dict[str, list[dict]],
-        pinned_refs: set[str],
-    ) -> tuple[list[dict], set[str]]:
-        condensed_groups: list[dict] = []
-        condensed_member_refs: set[str] = set()
-        if compressed_groups:
-            for cg in compressed_groups:
-                condensed_groups.append({
-                    "ref": cg.representative_ref,
-                    "ref_type": "container",
-                    "role": cg.role,
-                    "compressed": True,
-                    "count": cg.count,
-                    "member_refs": cg.member_refs,
-                    "xpath_template": cg.xpath_template,
-                })
-                for ref in cg.member_refs:
-                    condensed_member_refs.add(ref)
-            return condensed_groups, condensed_member_refs
-
-        candidate_groups: list[tuple[dict, list[dict]]] = []
-        for node in nodes:
-            if node["ref_type"] != "container":
-                continue
-            descendants = self._descendant_elements(node["ref"], children)
-            if not self._is_condensable_group(node, lookup, children, descendants):
-                continue
-            if not descendants:
-                continue
-            candidate_groups.append((node, descendants))
-
-        if not candidate_groups:
-            fallback_groups = []
-            for node in nodes:
-                if node["ref_type"] != "container":
-                    continue
-                descendants = self._descendant_elements(node["ref"], children)
-                if len(descendants) < 6:
-                    continue
-                if node["role"] in {"banner", "complementary", "contentinfo", "dialog", "form", "navigation", "search"}:
-                    continue
-                if sum(1 for item in descendants if self._is_pinned_control(item, lookup, children)) >= 3:
-                    continue
-                fallback_groups.append((node, descendants))
-            fallback_groups.sort(key=lambda item: len(item[1]), reverse=True)
-            candidate_groups = fallback_groups[:1]
-
-        for node, descendants in candidate_groups:
-            condensed_groups.append(self._group_summary(node, descendants))
-            for descendant in descendants:
-                if descendant["ref"] not in pinned_refs:
-                    condensed_member_refs.add(descendant["ref"])
-        return condensed_groups, condensed_member_refs
-
-    def _build_viewport_nodes(
-        self, nodes: list[dict], pinned_refs: set[str], condensed_member_refs: set[str]
-    ) -> list[dict]:
-        viewport_nodes: list[dict] = []
-        for node in nodes:
-            if node["ref"] in pinned_refs or node["ref"] in condensed_member_refs:
-                continue
-            if not node["visibility"]["in_viewport"]:
-                continue
-            if node["ref_type"] == "container" and not self._should_surface_container(node):
-                continue
-            viewport_nodes.append(self._node_summary(node))
-        return viewport_nodes
-
-    def _build_planner_result(
-        self,
-        nodes: list[dict],
-        pinned_controls: list[dict],
-        viewport_nodes: list[dict],
-        condensed_groups: list[dict],
-        compressed_groups: list | None,
-    ) -> dict:
-        surfaced_refs = (
-            {item["ref"] for item in pinned_controls}
-            | {item["ref"] for item in viewport_nodes}
-            | {item["ref"] for item in condensed_groups}
-        )
-        omitted_nodes = [node for node in nodes if node["ref"] not in surfaced_refs]
-        result = {
-            "pinned_controls": pinned_controls,
-            "viewport_nodes": viewport_nodes,
-            "condensed_groups": condensed_groups,
-            "stats": {
-                "total_nodes": len(nodes),
-                "total_elements": sum(1 for node in nodes if node["ref_type"] == "element"),
-                "total_containers": sum(1 for node in nodes if node["ref_type"] == "container"),
-                "pinned_control_count": len(pinned_controls),
-                "viewport_node_count": len(viewport_nodes),
-                "condensed_group_count": len(condensed_groups),
-            },
-            "omitted_summary": {
-                "omitted_node_count": len(omitted_nodes),
-                "omitted_element_count": sum(1 for node in omitted_nodes if node["ref_type"] == "element"),
-                "omitted_container_count": sum(1 for node in omitted_nodes if node["ref_type"] == "container"),
-            },
-        }
-        if compressed_groups:
-            result["compressed_groups_count"] = len(compressed_groups)
-        return result
-
     def _filter_text_matches(self, nodes: list[dict], query: str) -> list[dict]:
         from dp_cli.models import score_text_match
         lookup = {node["ref"]: node for node in nodes}
@@ -645,23 +498,6 @@ class CliService:
                 descendants.append(node)
             queue.extend(children.get(node["ref"], []))
         return descendants
-
-    def _node_summary(self, node: dict) -> dict:
-        return {
-            "ref": node["ref"],
-            "ref_type": node["ref_type"],
-            "role": node["role"],
-            "name": node["name"],
-            "text": node["text"],
-            "id": node["id"],
-            "depth": node["depth"],
-            "visibility": node["visibility"],
-            "context": node["context"],
-            "states": node["states"],
-        }
-
-    def _should_surface_container(self, node: dict) -> bool:
-        return node["role"] in SURFACE_CONTAINER_ROLES
 
     def _is_pinned_control(self, node: dict, lookup: dict[str, dict], children: dict[str, list[dict]]) -> bool:
         if node["ref_type"] != "element":
@@ -732,52 +568,6 @@ class CliService:
             current_ref = parent.get("parent_ref")
         return False
 
-    def _group_summary(self, node: dict, descendants: list[dict]) -> dict:
-        return {
-            "ref": node["ref"],
-            "ref_type": node["ref_type"],
-            "role": node["role"],
-            "name": node["name"],
-            "text": node["text"],
-            "depth": node["depth"],
-            "visibility": node["visibility"],
-            "context": node["context"],
-            "child_count": len(descendants),
-            "sample_labels": self._sample_labels(descendants),
-        }
-
-    def _is_condensable_group(
-        self,
-        node: dict,
-        lookup: dict[str, dict],
-        children: dict[str, list[dict]],
-        descendants: list[dict] | None = None,
-    ) -> bool:
-        if node["role"] in {"banner", "complementary", "contentinfo", "dialog", "form", "navigation", "search"}:
-            return False
-        bounds = node.get("bounds", {})
-        if bounds.get("x", 9999) <= 200 and bounds.get("width", 9999) <= 320 and node.get("depth", 0) <= 8:
-            return False
-        descendants = descendants or self._descendant_elements(node["ref"], children)
-        if len(descendants) < 6:
-            return False
-        if sum(1 for item in descendants if item.get("role") in {"link", "button"}) < 6:
-            return False
-        if sum(1 for item in descendants if self._is_pinned_control(item, lookup, children)) >= 3:
-            return False
-        return len(self._sample_labels(descendants)) >= 3
-
-    def _sample_labels(self, nodes: list[dict], limit: int = 3) -> list[str]:
-        labels: list[str] = []
-        for node in nodes:
-            label = (node.get("name") or node.get("text") or "").strip()
-            if not label or label in labels:
-                continue
-            labels.append(label)
-            if len(labels) >= limit:
-                break
-        return labels
-
     def _searchable_text(self, node: dict) -> str:
         return self._normalized(
             " ".join(
@@ -823,9 +613,9 @@ class CliService:
             children_map[parent_ref] = [c["ref"] for c in child_nodes]
 
         interactable = [
-            {"ref": n["ref"], "role": n["role"], "name": n["name"]}
+            {"ref": n["ref"], "role": n["role"], "name": n["name"], "in_viewport": n["visibility"]["in_viewport"]}
             for n in nodes
-            if n["ref_type"] == "element" and n["visibility"]["interactable_now"]
+            if n["ref_type"] == "element" and n["role"] in {"button", "link", "textbox", "checkbox", "radio", "combobox", "slider", "spinbutton", "switch", "tab"}
         ]
 
         stats = {

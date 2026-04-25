@@ -141,7 +141,7 @@ python -m dp_cli snapshot --session demo --mode extract
   "session": "demo",
   "action": "snapshot",
   "data": {
-    "schema_version": "0.5",
+    "schema_version": "0.6",
     "mode": "agent_summary",
     "page": {
       "url": "https://example.com",
@@ -156,21 +156,31 @@ python -m dp_cli snapshot --session demo --mode extract
     "scope": "page",
     "root_ref": null,
     "depth": null,
-    "planner_view": {
-      "pinned_controls": [
-        {
-          "ref": "e1",
-          "ref_type": "element",
-          "role": "link",
-          "name": "More information",
-          "text": "More information...",
-          "locator": "xpath:/html/body/div/p[2]/a"
-        }
+    "index": {
+      "interactable_elements": [
+        {"ref": "e1", "role": "link", "name": "More information"},
+        {"ref": "e2", "role": "button", "name": "Submit"}
       ],
-      "viewport_nodes": [ ... ],
-      "condensed_groups": [ ... ],
-      "stats": { ... },
-      "omitted_summary": "..."
+      "surface_index": [
+        {"ref": "r1", "ref_type": "container", "role": "search", "name": "Search", "child_count": 3, "in_viewport": true, "interactable_now": false},
+        {"ref": "e1", "ref_type": "element", "role": "link", "name": "More information", "child_count": 0, "in_viewport": true, "interactable_now": true}
+      ],
+      "deep_index": [
+        {"ref": "r2", "ref_type": "container", "role": "generic", "name": "", "text": "Footer copyright text...", "in_viewport": false}
+      ],
+      "tree": {
+        "roots": ["r1", "r2"],
+        "parent_map": {"e1": "r1", "e2": "r1"},
+        "children_map": {"r1": ["e1", "e2"]}
+      },
+      "stats": {
+        "total_nodes": 42,
+        "surface_count": 12,
+        "deep_count": 30,
+        "in_viewport": 20,
+        "offscreen": 22,
+        "interactable_now": 8
+      }
     }
   },
   "error": null

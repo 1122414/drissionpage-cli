@@ -294,3 +294,42 @@ def test_find_and_click_can_operate_on_offscreen_pagination(local_fixture_server
         assert next_page_after.get("in_viewport") is True
     finally:
         cleanup_session(local_session)
+
+
+def test_snapshot_index_structure_meets_design_criteria(local_fixture_server, local_session):
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        snapshot = run_cli("snapshot", "--session", local_session, "--headless")
+        data = snapshot["data"]
+        assert data["schema_version"] == "0.6"
+        index = data["index"]
+        stats = index["stats"]
+        total = stats["total_nodes"]
+        surface = stats["surface_count"]
+        deep = stats["deep_count"]
+
+        # 1. surface + deep = total (mutual exclusivity + completeness)
+        assert surface + deep == total
+
+        # 2. surface index should be <= 30% of total (design guideline)
+        assert surface / total <= 0.30
+
+        # 3. No empty string values in interactable_elements
+        for item in index.get("interactable_elements", []):
+            for key, value in item.items():
+                assert value != "", f"Empty string in interactable_elements.{key}: {item}"
+
+        # 4. No null values at top level of index fields
+        for item in index.get("surface_index", []):
+            assert item.get("ref") is not None
+            assert item.get("ref_type") is not None
+
+        # 5. Tree structure consistency
+        tree = index.get("tree", {})
+        children_map = tree.get("children_map", {})
+        parent_map = tree.get("parent_map", {})
+        for child_ref, parent_ref in parent_map.items():
+            assert parent_ref in children_map, f"Parent {parent_ref} not in children_map"
+            assert child_ref in children_map.get(parent_ref, []), f"Child {child_ref} not in parent's children"
+    finally:
+        cleanup_session(local_session)
