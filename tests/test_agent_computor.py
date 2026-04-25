@@ -256,6 +256,8 @@ class DPCLIAgent:
             safe["locator"] = params["locator"]
         if skill == "type" and "text" in params:
             safe["text"] = params["text"]
+        if skill == "type" and "locator" in params:
+            safe["locator"] = params["locator"]
         if skill == "open" and "url" in params:
             safe["url"] = params["url"]
         if skill == "find" and "text" in params:
@@ -1104,6 +1106,16 @@ def test_is_duplicate_action():
     # Same locator is duplicate
     assert agent._is_duplicate_action("click", {"locator": "#btn1"}) is True
     print("  PASSED: same locator is duplicate")
+
+    # Type with same text but different locator is not duplicate
+    agent.recent_actions.clear()
+    agent._record_action("type", {"locator": "#inputA", "text": "hello"}, {"ok": True})
+    assert agent._is_duplicate_action("type", {"locator": "#inputB", "text": "hello"}) is False
+    print("  PASSED: type with same text but different locator is not duplicate")
+
+    # Type with same locator is duplicate
+    assert agent._is_duplicate_action("type", {"locator": "#inputA", "text": "world"}) is True
+    print("  PASSED: type with same locator is duplicate")
 
     # Bypass via snapshot in between (should still detect across last 3)
     agent.recent_actions.clear()
