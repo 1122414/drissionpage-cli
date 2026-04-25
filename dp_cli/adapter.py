@@ -264,8 +264,21 @@ function contextInfo(node) {
 
 function isInteractiveNode(node) {
   const role = computedRole(node);
+  const tag = (node.tagName || '').toLowerCase();
   if (node.matches('a,button,input,textarea,select,summary,[onclick],[contenteditable="true"]')) return true;
-  return ['button', 'link', 'textbox', 'checkbox', 'radio', 'tab', 'switch', 'combobox', 'option'].includes(role);
+  if (['button', 'link', 'textbox', 'checkbox', 'radio', 'tab', 'switch', 'combobox', 'option'].includes(role)) return true;
+  // Icon/button spans and i tags with common class patterns
+  const className = (node.className || '').toLowerCase();
+  if (className && /\b(icon|btn|button|search|submit|close|menu|toggle)\b/.test(className)) return true;
+  // Elements with pointer cursor that have click handlers or are inside clickable parents
+  const style = window.getComputedStyle ? window.getComputedStyle(node) : null;
+  if (style && style.cursor === 'pointer') {
+    if (node.closest && node.closest('a,button,[onclick]')) return true;
+    // Pseudo-elements used as buttons inside clickable wrappers
+    const parent = node.parentElement;
+    if (parent && (parent.matches('a,button') || parent.getAttribute('onclick'))) return true;
+  }
+  return false;
 }
 
 function isSemanticContainer(node) {

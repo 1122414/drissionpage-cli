@@ -233,6 +233,18 @@ class DPCLIAgent:
         if len(self.recent_actions) > 3:
             self.recent_actions.pop(0)
 
+    def _is_duplicate_action(self, skill: str, params: dict[str, Any]) -> bool:
+        if skill in ("snapshot", "open"):
+            return False
+        if not self.recent_actions:
+            return False
+        last = self.recent_actions[-1]
+        if last.get("skill") != skill:
+            return False
+        safe = self._safe_params(skill, params)
+        last_safe = last.get("params", {})
+        return safe == last_safe
+
     def _safe_params(self, skill: str, params: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(params, dict):
             return {}
@@ -288,7 +300,13 @@ class DPCLIAgent:
             "4. REQUIRED: If not in surface_index, use 'find' with --text or --locator. find searches ALL visible elements.\n"
             "5. REQUIRED: 'type' and 'click' MUST use 'ref' param whenever possible. Only use 'locator' as last resort.\n"
             "6. If a click causes 'ref_stale' error, the page navigated — take a new snapshot immediately.\n"
-            "7. NEVER REPEAT the same action consecutively. If you just typed text successfully (ok=true), do NOT type again — proceed to click the submit/search button.\n\n"
+            "7. ANTI-REPETITION RULE (prevents infinite loops):\n"
+            "   - Definition: 'same action' = same skill AND same key params (ref, text, url, locator).\n"
+            "   - If your last action was type --ref e12, your NEXT action CANNOT be type --ref e12 (even if it failed).\n"
+            "   - If your last action was click --ref e13, your NEXT action CANNOT be click --ref e13.\n"
+            "   - EXCEPTIONS (these ARE allowed to repeat): snapshot, open — you may snapshot multiple times.\n"
+            "   - After type, your next step MUST be click (submit/search) or snapshot — NEVER type again.\n"
+            "   - If an action fails (ok=false), do NOT blindly retry the same action. Try a different approach (e.g., use find instead of ref).\n\n"
             "STANDARD INTERACTION WORKFLOW (memorize this):\n"
             "Step A: snapshot → get index\n"
             "Step B: Check interactable_elements → click/type by ref if found\n"
@@ -588,8 +606,15 @@ class DPCLIAgent:
                     break
 
                 print(f"[Agent] Step {step}: {skill} - {action.get('reason', '')}")
-                result = self.execute_skill(skill, action.get("params") or {})
-                self._record_action(skill, action.get("params") or {}, result)
+                params = action.get("params") or {}
+                if self._is_duplicate_action(skill, params):
+                    print(f"[Agent] BLOCKED duplicate action: {skill} with same params. Forcing snapshot to refresh state.")
+                    result = self.executor.snapshot(mode="agent_summary")
+                    skill = "snapshot"
+                    params = {"mode": "agent_summary"}
+                else:
+                    result = self.execute_skill(skill, params)
+                self._record_action(skill, params, result)
 
                 err = result.get("error")
                 if isinstance(err, dict):

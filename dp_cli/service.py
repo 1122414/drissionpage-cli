@@ -147,13 +147,12 @@ class CliService:
             else:
                 nodes = runtime.upsert_nodes(self.adapter.snapshot_nodes(runtime.tab, depth=None))
                 nodes = self._filter_text_matches(nodes, text or "")
-            elements = [node for node in nodes if node["ref_type"] == "element"]
             runtime.persist()
             return {
                 "page": self._page_payload(runtime),
                 "page_identity": self._page_identity_payload(runtime),
-                "count": len(elements),
-                "nodes": elements,
+                "count": len(nodes),
+                "nodes": nodes,
                 "query": {"locator": locator, "text": text},
             }
 
