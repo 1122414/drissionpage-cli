@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Any
+from typing import Any, Callable
 
 from dp_cli.errors import CliError
 from dp_cli.models import DEFAULT_SESSION
@@ -57,7 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser = subparsers.add_parser("extract", help="Extract structured data from a group.")
     extract_parser.add_argument("target_ref")
     extract_parser.add_argument("--schema", nargs="+", default=None)
-    extract_parser.add_argument("--sample-only", action="store_true")
+    extract_parser.add_argument("--limit", type=int, default=None, help="Max number of items to extract")
+    extract_parser.add_argument("--sample-only", action="store_true", help="(Deprecated: use --limit) Extract first 3 items only")
     _add_common_args(extract_parser)
 
     resolve_parser = subparsers.add_parser("resolve-locator", help="Resolve ref to locator candidates.")
@@ -97,9 +98,99 @@ def failure(session: str, action: str, error: CliError | Exception) -> dict[str,
     return {"ok": False, "session": session, "action": action, "data": None, "error": payload}
 
 
+_COMMAND_MAP: dict[str, Callable[[argparse.Namespace, CliService], dict[str, Any]]] = {
+    "open": lambda a, s: success(
+        a.session, "open", s.open_page(a.url, session=a.session, headless=a.headless)
+    ),
+    "find": lambda a, s: success(
+        a.session,
+        "find",
+        s.find_elements(
+            session=a.session,
+            locator=getattr(a, "locator", None),
+            text=getattr(a, "text", None),
+            headless=a.headless,
+        ),
+    ),
+    "click": lambda a, s: success(
+        a.session,
+        "click",
+        s.click_element(
+            session=a.session,
+            ref=getattr(a, "ref", None),
+            locator=getattr(a, "locator", None),
+            headless=a.headless,
+        ),
+    ),
+    "type": lambda a, s: success(
+        a.session,
+        "type",
+        s.type_into_element(
+            a.text,
+            session=a.session,
+            ref=getattr(a, "ref", None),
+            locator=getattr(a, "locator", None),
+            headless=a.headless,
+        ),
+    ),
+    "expand": lambda a, s: success(
+        a.session,
+        "expand",
+        s.expand_container(
+            session=a.session,
+            ref=a.ref,
+            depth=a.depth,
+            headless=a.headless,
+        ),
+    ),
+    "list-items": lambda a, s: success(
+        a.session,
+        "list-items",
+        s.list_items(
+            session=a.session,
+            group_ref=a.group_ref,
+            sample_size=a.sample_size,
+            headless=a.headless,
+        ),
+    ),
+    "extract": lambda a, s: success(
+        a.session,
+        "extract",
+        s.extract_group(
+            session=a.session,
+            target_ref=a.target_ref,
+            schema=a.schema,
+            limit=a.limit if a.limit is not None else (3 if a.sample_only else None),
+            headless=a.headless,
+        ),
+    ),
+    "resolve-locator": lambda a, s: success(
+        a.session,
+        "resolve-locator",
+        s.resolve_locator(
+            session=a.session,
+            ref=a.ref,
+            headless=a.headless,
+        ),
+    ),
+    "eval": lambda a, s: success(
+        a.session,
+        "eval",
+        s.eval_js(
+            session=a.session,
+            js=a.js,
+            headless=a.headless,
+        ),
+    ),
+    "session": lambda a, s: success(
+        a.session,
+        "session.inspect",
+        s.inspect_session(session=a.session, headless=a.headless),
+    ),
+}
+
+
 def dispatch(args: argparse.Namespace, service: CliService) -> dict[str, Any]:
-    if args.command == "open":
-        return success(args.session, "open", service.open_page(args.url, session=args.session, headless=args.headless))
     if args.command == "snapshot":
         view = getattr(args, "view", None)
         mode = getattr(args, "mode", "agent_summary")
@@ -116,100 +207,9 @@ def dispatch(args: argparse.Namespace, service: CliService) -> dict[str, Any]:
                 headless=args.headless,
             ),
         )
-    if args.command == "find":
-        return success(
-            args.session,
-            "find",
-            service.find_elements(
-                session=args.session,
-                locator=getattr(args, "locator", None),
-                text=getattr(args, "text", None),
-                headless=args.headless,
-            ),
-        )
-    if args.command == "click":
-        return success(
-            args.session,
-            "click",
-            service.click_element(
-                session=args.session,
-                ref=getattr(args, "ref", None),
-                locator=getattr(args, "locator", None),
-                headless=args.headless,
-            ),
-        )
-    if args.command == "type":
-        return success(
-            args.session,
-            "type",
-            service.type_into_element(
-                args.text,
-                session=args.session,
-                ref=getattr(args, "ref", None),
-                locator=getattr(args, "locator", None),
-                headless=args.headless,
-            ),
-        )
-    if args.command == "expand":
-        return success(
-            args.session,
-            "expand",
-            service.expand_container(
-                session=args.session,
-                ref=args.ref,
-                depth=args.depth,
-                headless=args.headless,
-            ),
-        )
-    if args.command == "list-items":
-        return success(
-            args.session,
-            "list-items",
-            service.list_items(
-                session=args.session,
-                group_ref=args.group_ref,
-                sample_size=args.sample_size,
-                headless=args.headless,
-            ),
-        )
-    if args.command == "extract":
-        return success(
-            args.session,
-            "extract",
-            service.extract_group(
-                session=args.session,
-                target_ref=args.target_ref,
-                schema=args.schema,
-                sample_only=args.sample_only,
-                headless=args.headless,
-            ),
-        )
-    if args.command == "resolve-locator":
-        return success(
-            args.session,
-            "resolve-locator",
-            service.resolve_locator(
-                session=args.session,
-                ref=args.ref,
-                headless=args.headless,
-            ),
-        )
-    if args.command == "eval":
-        return success(
-            args.session,
-            "eval",
-            service.eval_js(
-                session=args.session,
-                js=args.js,
-                headless=args.headless,
-            ),
-        )
-    if args.command == "session" and args.session_command == "inspect":
-        return success(
-            args.session,
-            "session.inspect",
-            service.inspect_session(session=args.session, headless=args.headless),
-        )
+    handler = _COMMAND_MAP.get(args.command)
+    if handler:
+        return handler(args, service)
     raise CliError("unknown_command", f"Unsupported command: {args.command}")
 
 

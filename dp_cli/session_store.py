@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import warnings
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -123,9 +124,8 @@ class SessionStore:
             data.setdefault("runtime_status", "stale")
             data.setdefault("browser_pid", None)
             data.setdefault("last_seen_at", None)
-            if headless is not None and bool(headless) != bool(data.get("headless", False)):
-                if not port_is_listening(int(data["port"])):
-                    data["headless"] = bool(headless)
+            if headless is not None:
+                data["headless"] = bool(headless)
             write_json(paths.meta_file, data)
         return SessionMeta(**data)
 
@@ -155,13 +155,34 @@ class SessionStore:
         active_page.setdefault("snapshot_id", None)
         active_page.setdefault("snapshot_seq", 0)
         data["active_page"] = ActivePage(**active_page)
+        # TODO: Remove these migrations after confirming no legacy sessions remain (target: 2026-07-01)
         if "refs" in data and "element_refs" not in data:
+            warnings.warn(
+                "Legacy session field 'refs' detected and migrated to 'element_refs'. Support will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             data["element_refs"] = data.get("refs", {})
         if "next_ref_index" in data and "next_element_index" not in data:
+            warnings.warn(
+                "Legacy session field 'next_ref_index' detected and migrated to 'next_element_index'. Support will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             data["next_element_index"] = data.get("next_ref_index", 1)
         if "region_refs" in data and "container_refs" not in data:
+            warnings.warn(
+                "Legacy session field 'region_refs' detected and migrated to 'container_refs'. Support will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             data["container_refs"] = data.get("region_refs", {})
         if "next_region_index" in data and "next_container_index" not in data:
+            warnings.warn(
+                "Legacy session field 'next_region_index' detected and migrated to 'next_container_index'. Support will be removed in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             data["next_container_index"] = data.get("next_region_index", 1)
         data.setdefault("container_refs", {})
         data.setdefault("element_refs", {})

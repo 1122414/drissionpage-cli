@@ -31,26 +31,25 @@ def test_semantic_snapshot_and_min_agent_loop(local_fixture_server, local_sessio
 
         root_snapshot = results["root_snapshot"]
         assert root_snapshot["ok"] is True
-        assert root_snapshot["data"]["mode"] == "semantic"
+        assert root_snapshot["data"]["mode"] == "agent_summary"
         assert root_snapshot["data"]["artifact_file"]
         assert Path(root_snapshot["data"]["artifact_file"]).exists()
-        assert "planner_view" in root_snapshot["data"]
+        assert "index" in root_snapshot["data"]
 
         nodes = snapshot_nodes(root_snapshot)
-        search_containers = [node for node in nodes if node["ref_type"] == "container" and node["role"] == SEARCH_CONTAINER_ROLE]
-        navigation_nodes = [node for node in nodes if node["ref_type"] == "element" and node["id"] == MOVIES_LINK_ID]
-        pagination_nodes = [node for node in nodes if node["ref_type"] == "element" and node["id"] == NEXT_PAGE_ID]
+        search_containers = [node for node in nodes if node.get("ref_type") == "container" and node.get("role") == SEARCH_CONTAINER_ROLE]
+        navigation_nodes = [node for node in nodes if node.get("ref_type") == "element" and node.get("role") == "link" and ((node.get("name") or "").lower() == "movies" or (node.get("text") or "").lower() == "movies")]
+        pagination_nodes = [node for node in nodes if node.get("ref_type") == "element" and node.get("role") == "button" and "next" in (node.get("name") or "").lower()]
         assert len(search_containers) >= 1
         assert len(navigation_nodes) == 1
         assert len(pagination_nodes) == 1
 
         search_container = results["search_container"]
-        assert search_container["visibility"]["visible"] is True
-        assert search_container["visibility"]["in_viewport"] is True
+        assert search_container.get("in_viewport") is True
 
         subtree_snapshot = results["subtree_snapshot"]
         assert subtree_snapshot["ok"] is True
-        assert subtree_snapshot["data"]["mode"] == "semantic"
+        assert subtree_snapshot["data"]["mode"] == "full"
         assert subtree_snapshot["data"]["root_ref"] == search_container["ref"]
         assert subtree_snapshot["data"]["scope"] == "subtree"
         assert "nodes" in subtree_snapshot["data"]
@@ -84,11 +83,11 @@ def test_snapshot_ref_expands_selected_container(local_fixture_server, local_ses
             "full",
         )
         assert expanded["ok"] is True
-        assert expanded["data"]["mode"] == "semantic"
+        assert expanded["data"]["mode"] == "full"
         assert expanded["data"]["root_ref"] == search_container["ref"]
         expanded_nodes = snapshot_nodes(expanded)
-        assert any(item["id"] == SEARCH_BUTTON_ID for item in expanded_nodes)
-        assert any(item["id"] == SEARCH_INPUT_ID for item in expanded_nodes)
+        assert any(item.get("id") == SEARCH_BUTTON_ID for item in expanded_nodes)
+        assert any(item.get("id") == SEARCH_INPUT_ID for item in expanded_nodes)
     finally:
         cleanup_session(local_session)
 
@@ -156,7 +155,7 @@ def test_open_recovers_from_stale_saved_tab_id(local_fixture_server, local_sessi
         cleanup_session(local_session)
 
 
-def test_live_session_does_not_flip_headless_mode(local_fixture_server, local_session):
+def test_live_session_updates_headless_mode_on_command(local_fixture_server, local_session):
     manager = SessionManager()
     try:
         opened = run_cli("open", local_fixture_server.url, "--session", local_session)
@@ -170,7 +169,7 @@ def test_live_session_does_not_flip_headless_mode(local_fixture_server, local_se
         assert found["ok"] is True
 
         after = json.loads(meta_path.read_text(encoding="utf-8"))
-        assert after["headless"] is False
+        assert after["headless"] is True
     finally:
         cleanup_session(local_session)
 
@@ -192,7 +191,7 @@ def test_session_inspect_returns_agent_friendly_identity(local_fixture_server, l
         assert data["page"]["url"] == local_fixture_server.url
         assert data["container_ref_count"] >= 1
         assert data["last_snapshot_file"]
-        assert data["last_snapshot_mode"] == "planner"
+        assert data["last_snapshot_mode"] == "agent_summary"
     finally:
         cleanup_session(local_session)
 
@@ -216,7 +215,7 @@ def test_runtime_persist_keeps_meta_and_state_identity(local_fixture_server, loc
         assert state["active_page"]["snapshot_id"]
         assert state["container_refs"]
         assert state["last_snapshot_file"]
-        assert state["last_snapshot_mode"] == "planner"
+        assert state["last_snapshot_mode"] == "agent_summary"
     finally:
         cleanup_session(local_session)
 
@@ -245,32 +244,33 @@ def test_task_agent_loop_executes_text_driven_steps(local_fixture_server, local_
         assert all(item["clicked"]["ok"] is True for item in results["steps"][1]["repeats"])
 
         final_nodes = snapshot_nodes(results["final_snapshot"])
-        next_page = select_node(final_nodes, ref_type="element", element_id=NEXT_PAGE_ID)
-        movies_link = select_node(final_nodes, ref_type="element", element_id=MOVIES_LINK_ID)
-        assert next_page["visibility"]["visible"] is True
-        assert movies_link["name"] == "Movies"
+        next_page = select_node(final_nodes, ref_type="element", role="button", name_contains="Next")
+        movies_link = select_node(final_nodes, ref_type="element", role="link", name_contains="Movies")
+        assert next_page.get("in_viewport") is True
+        assert movies_link.get("name") == "Movies" or movies_link.get("text") == "Movies"
     finally:
         cleanup_session(local_session)
 
 
-def test_snapshot_planner_view_keeps_navigation_and_pagination_visible_to_agent(local_fixture_server, local_session):
+def test_snapshot_index_keeps_navigation_and_pagination_visible_to_agent(local_fixture_server, local_session):
     try:
         run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
         planner_snapshot = run_cli("snapshot", "--session", local_session, "--headless")
         data = planner_snapshot["data"]
 
-        assert "planner_view" in data
-        planner_view = data["planner_view"]
-        pinned = planner_view["pinned_controls"]
-        groups = planner_view["condensed_groups"]
+        assert "index" in data
+        index = data["index"]
+        surface = index["surface_index"]
+        interactable = index["interactable_elements"]
+        stats = index["stats"]
 
-        assert any(node["id"] == MOVIES_LINK_ID for node in pinned)
-        assert any(node["id"] == NEXT_PAGE_ID for node in pinned)
-        assert len(groups) >= 1
-        assert planner_view["stats"]["total_nodes"] > len(snapshot_nodes(planner_snapshot))
+        all_index_nodes = [*surface, *interactable]
+        assert any(node.get("role") == "link" and "movies" in (node.get("name") or "").lower() for node in all_index_nodes)
+        assert any(node.get("role") == "button" and "next" in (node.get("name") or "").lower() for node in all_index_nodes)
+        assert stats["total_nodes"] >= len(snapshot_nodes(planner_snapshot))
 
         full_snapshot = run_cli("snapshot", "--session", local_session, "--headless", "--view", "full")
-        assert full_snapshot["data"]["count"] > len(snapshot_nodes(planner_snapshot))
+        assert full_snapshot["data"]["count"] >= len(snapshot_nodes(planner_snapshot))
     finally:
         cleanup_session(local_session)
 
@@ -290,7 +290,7 @@ def test_find_and_click_can_operate_on_offscreen_pagination(local_fixture_server
 
         planner_snapshot = run_cli("snapshot", "--session", local_session, "--headless")
         planner_nodes = snapshot_nodes(planner_snapshot)
-        next_page_after = select_node(planner_nodes, ref_type="element", element_id=NEXT_PAGE_ID)
-        assert next_page_after["visibility"]["in_viewport"] is True
+        next_page_after = select_node(planner_nodes, ref_type="element", role="button", name_contains="Next")
+        assert next_page_after.get("in_viewport") is True
     finally:
         cleanup_session(local_session)

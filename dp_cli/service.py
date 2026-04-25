@@ -6,7 +6,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 
 from dp_cli.adapter import DrissionPageAdapter
-from dp_cli.compressor import CompressionConfig, DOMCompressor
+from dp_cli.compressor import CompressedGroup, CompressionConfig, DOMCompressor
 from dp_cli.errors import (
     ElementNotFoundError,
     ElementNotInteractableError,
@@ -104,26 +104,18 @@ class CliService:
 
             records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=root_xpath, depth=snapshot_depth)
             nodes = runtime.upsert_nodes(records)
-            compressed_groups = self._compress_nodes(nodes)
-            summary_projector = SummaryProjector()
-            recovery_projector = RecoveryProjector()
-            budget_enforcer = TokenBudgetEnforcer()
-            base_summary = summary_projector.project(nodes, compressed_groups, recovery_projector.project(nodes))
-            agent_summary, recovery = budget_enforcer.enforce(base_summary)
-            planner_view = self._build_planner_view(nodes, compressed_groups)
+            index = self._build_index(nodes)
 
             payload = {
-                "schema_version": "0.5",
+                "schema_version": "0.6",
                 "mode": mode,
                 "page": self._page_payload(runtime),
                 "page_identity": self._page_identity_payload(runtime),
                 "scope": scope,
                 "root_ref": root_ref,
                 "depth": snapshot_depth,
+                "index": index,
             }
-            from dataclasses import asdict
-            groups_data = [asdict(g) for g in compressed_groups] if compressed_groups else []
-            recovery_data = asdict(recovery) if recovery else {}
             artifact_file = self._write_snapshot_artifact(
                 session=session,
                 artifact=SnapshotArtifact(
@@ -134,10 +126,8 @@ class CliService:
                     root_ref=root_ref,
                     depth=snapshot_depth,
                     nodes=nodes,
-                    planner_view=planner_view,
-                    schema_version="0.5",
-                    groups=groups_data,
-                    recovery=recovery_data,
+                    planner_view=index,
+                    schema_version="0.6",
                 ),
                 snapshot_id=runtime.state.active_page.snapshot_id or "snapshot",
             )
@@ -148,19 +138,11 @@ class CliService:
             if mode == "full":
                 payload["count"] = len(nodes)
                 payload["nodes"] = nodes
-                payload["groups"] = groups_data
-                payload["recovery"] = recovery_data
+                payload["index"] = index
             elif mode == "agent_summary":
-                payload["summary"] = {
-                    "global_actions": agent_summary.global_actions,
-                    "visible_focus": agent_summary.visible_focus,
-                    "repeated_regions": agent_summary.repeated_regions,
-                }
-                payload["recovery"] = recovery_data
-                payload["planner_view"] = planner_view
+                payload["index"] = index
             else:
-                payload["summary"] = planner_view
-                payload["planner_view"] = planner_view
+                payload["index"] = index
             return payload
 
     def find_elements(
@@ -269,7 +251,17 @@ class CliService:
             records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=group_item["xpath"], depth=2)
             nodes = runtime.upsert_nodes(records)
             compressed_groups = self._compress_nodes(nodes)
-            group = compressed_groups[0] if compressed_groups else {"representative_ref": group_ref, "count": len(nodes), "member_refs": [n["ref"] for n in nodes[:sample_size]]}
+            if compressed_groups:
+                cg = compressed_groups[0]
+                group = {
+                    "representative_ref": cg.representative_ref,
+                    "count": cg.count,
+                    "member_refs": cg.member_refs,
+                    "role": cg.role,
+                    "tag": cg.tag,
+                }
+            else:
+                group = {"representative_ref": group_ref, "count": len(nodes), "member_refs": [n["ref"] for n in nodes[:sample_size]]}
             from dp_cli.grouper import FieldSchemaExtractor, GroupKindDetector
             kind = GroupKindDetector().detect(group, nodes)
             fields = FieldSchemaExtractor().extract(group.get("member_refs", []), nodes)
@@ -288,21 +280,34 @@ class CliService:
         session: str = DEFAULT_SESSION,
         target_ref: str | None = None,
         schema: list[str] | None = None,
-        sample_only: bool = False,
+        limit: int | None = None,
         headless: bool | None = None,
     ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
             runtime.begin_snapshot()
             target_item = self._ref_item(runtime, target_ref)
-            records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=target_item["xpath"], depth=2)
+            records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=target_item["xpath"], depth=6)
             nodes = runtime.upsert_nodes(records)
             from dp_cli.projector import ExtractProjector
             projector = ExtractProjector()
             compressed_groups = self._compress_nodes(nodes)
-            group = compressed_groups[0] if compressed_groups else {"representative_ref": target_ref, "item_refs": [n["ref"] for n in nodes]}
+            if compressed_groups:
+                cg = compressed_groups[0]
+                all_element_refs = [n["ref"] for n in nodes if n["ref_type"] == "element"]
+                group = {
+                    "representative_ref": cg.representative_ref,
+                    "item_refs": all_element_refs,
+                    "count": cg.count,
+                }
+            else:
+                group = {
+                    "representative_ref": target_ref,
+                    "item_refs": [n["ref"] for n in nodes if n["ref_type"] == "element"],
+                }
             result = projector.project(group, nodes, schema)
-            if sample_only:
-                result["items"] = result["items"][:3]
+            if limit is not None and limit > 0:
+                result["items"] = result["items"][:limit]
+                result["item_count"] = len(result["items"])
             runtime.persist()
             return result
 
@@ -329,7 +334,7 @@ class CliService:
         headless: bool | None = None,
     ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
-            result = runtime.tab.run_js(js)
+            result = runtime.tab.run_js(js, as_expr=True)
             return {"result": result}
 
     def inspect_session(self, session: str = DEFAULT_SESSION, headless: bool | None = None) -> dict:
@@ -461,14 +466,23 @@ class CliService:
         path.write_text(json.dumps(artifact.to_output(), ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)
 
-    def _compress_nodes(self, nodes: list[dict]) -> list[dict]:
+    def _compress_nodes(self, nodes: list[dict]) -> list[CompressedGroup]:
         compressor = DOMCompressor(CompressionConfig(min_group_size=3))
         return compressor.compress(nodes)
 
     def _build_planner_view(self, nodes: list[dict], compressed_groups: list | None = None) -> dict:
         lookup = {node["ref"]: node for node in nodes}
         children = self._children_map(nodes)
+        pinned_controls, pinned_refs = self._build_pinned_controls(nodes, lookup, children)
+        condensed_groups, condensed_member_refs = self._build_condensed_groups(
+            nodes, compressed_groups, lookup, children, pinned_refs
+        )
+        viewport_nodes = self._build_viewport_nodes(nodes, pinned_refs, condensed_member_refs)
+        return self._build_planner_result(nodes, pinned_controls, viewport_nodes, condensed_groups, compressed_groups)
 
+    def _build_pinned_controls(
+        self, nodes: list[dict], lookup: dict[str, dict], children: dict[str, list[dict]]
+    ) -> tuple[list[dict], set[str]]:
         pinned_controls: list[dict] = []
         pinned_refs: set[str] = set()
         for node in nodes:
@@ -477,11 +491,18 @@ class CliService:
             if self._is_pinned_control(node, lookup, children):
                 pinned_controls.append(self._node_summary(node))
                 pinned_refs.add(node["ref"])
+        return pinned_controls, pinned_refs
 
+    def _build_condensed_groups(
+        self,
+        nodes: list[dict],
+        compressed_groups: list | None,
+        lookup: dict[str, dict],
+        children: dict[str, list[dict]],
+        pinned_refs: set[str],
+    ) -> tuple[list[dict], set[str]]:
         condensed_groups: list[dict] = []
         condensed_member_refs: set[str] = set()
-
-
         if compressed_groups:
             for cg in compressed_groups:
                 condensed_groups.append({
@@ -495,40 +516,45 @@ class CliService:
                 })
                 for ref in cg.member_refs:
                     condensed_member_refs.add(ref)
-        else:
-            candidate_groups: list[tuple[dict, list[dict]]] = []
+            return condensed_groups, condensed_member_refs
+
+        candidate_groups: list[tuple[dict, list[dict]]] = []
+        for node in nodes:
+            if node["ref_type"] != "container":
+                continue
+            descendants = self._descendant_elements(node["ref"], children)
+            if not self._is_condensable_group(node, lookup, children, descendants):
+                continue
+            if not descendants:
+                continue
+            candidate_groups.append((node, descendants))
+
+        if not candidate_groups:
+            fallback_groups = []
             for node in nodes:
                 if node["ref_type"] != "container":
                     continue
                 descendants = self._descendant_elements(node["ref"], children)
-                if not self._is_condensable_group(node, lookup, children, descendants):
+                if len(descendants) < 6:
                     continue
-                if not descendants:
+                if node["role"] in {"banner", "complementary", "contentinfo", "dialog", "form", "navigation", "search"}:
                     continue
-                candidate_groups.append((node, descendants))
+                if sum(1 for item in descendants if self._is_pinned_control(item, lookup, children)) >= 3:
+                    continue
+                fallback_groups.append((node, descendants))
+            fallback_groups.sort(key=lambda item: len(item[1]), reverse=True)
+            candidate_groups = fallback_groups[:1]
 
-            if not candidate_groups:
-                fallback_groups = []
-                for node in nodes:
-                    if node["ref_type"] != "container":
-                        continue
-                    descendants = self._descendant_elements(node["ref"], children)
-                    if len(descendants) < 6:
-                        continue
-                    if node["role"] in {"banner", "complementary", "contentinfo", "dialog", "form", "navigation", "search"}:
-                        continue
-                    if sum(1 for item in descendants if self._is_pinned_control(item, lookup, children)) >= 3:
-                        continue
-                    fallback_groups.append((node, descendants))
-                fallback_groups.sort(key=lambda item: len(item[1]), reverse=True)
-                candidate_groups = fallback_groups[:1]
+        for node, descendants in candidate_groups:
+            condensed_groups.append(self._group_summary(node, descendants))
+            for descendant in descendants:
+                if descendant["ref"] not in pinned_refs:
+                    condensed_member_refs.add(descendant["ref"])
+        return condensed_groups, condensed_member_refs
 
-            for node, descendants in candidate_groups:
-                condensed_groups.append(self._group_summary(node, descendants))
-                for descendant in descendants:
-                    if descendant["ref"] not in pinned_refs:
-                        condensed_member_refs.add(descendant["ref"])
-
+    def _build_viewport_nodes(
+        self, nodes: list[dict], pinned_refs: set[str], condensed_member_refs: set[str]
+    ) -> list[dict]:
         viewport_nodes: list[dict] = []
         for node in nodes:
             if node["ref"] in pinned_refs or node["ref"] in condensed_member_refs:
@@ -538,7 +564,16 @@ class CliService:
             if node["ref_type"] == "container" and not self._should_surface_container(node):
                 continue
             viewport_nodes.append(self._node_summary(node))
+        return viewport_nodes
 
+    def _build_planner_result(
+        self,
+        nodes: list[dict],
+        pinned_controls: list[dict],
+        viewport_nodes: list[dict],
+        condensed_groups: list[dict],
+        compressed_groups: list | None,
+    ) -> dict:
         surfaced_refs = (
             {item["ref"] for item in pinned_controls}
             | {item["ref"] for item in viewport_nodes}
@@ -563,12 +598,12 @@ class CliService:
                 "omitted_container_count": sum(1 for node in omitted_nodes if node["ref_type"] == "container"),
             },
         }
-
         if compressed_groups:
             result["compressed_groups_count"] = len(compressed_groups)
         return result
 
     def _filter_text_matches(self, nodes: list[dict], query: str) -> list[dict]:
+        from dp_cli.models import score_text_match
         lookup = {node["ref"]: node for node in nodes}
         children = self._children_map(nodes)
         normalized_query = self._normalized(query)
@@ -579,28 +614,15 @@ class CliService:
             haystack = self._searchable_text(node)
             if normalized_query not in haystack:
                 continue
-            score = 0
-            exact_name = self._normalized(node.get("name") or "")
-            exact_text = self._normalized(node.get("text") or "")
-            label_text = self._normalized(node.get("label") or "")
-            if exact_name == normalized_query:
-                score += 40
-            if exact_text == normalized_query:
-                score += 35
-            if label_text == normalized_query:
-                score += 25
-            if normalized_query in exact_name:
-                score += 15
-            if normalized_query in exact_text:
-                score += 12
-            if normalized_query in label_text:
-                score += 10
-            if self._is_pinned_control(node, lookup, children):
-                score += 20
-            if node["visibility"]["in_viewport"]:
-                score += 5
-            if node["visibility"]["interactable_now"]:
-                score += 5
+            node["_pinned"] = self._is_pinned_control(node, lookup, children)
+            score = score_text_match(
+                node,
+                normalized_query,
+                pinned_bias=20,
+                viewport_bias=5,
+                interactable_bias=5,
+            )
+            del node["_pinned"]
             matches.append((score, node))
         matches.sort(key=lambda item: item[0], reverse=True)
         return [node for _, node in matches]
@@ -781,3 +803,103 @@ class CliService:
 
     def _normalized(self, value: str) -> str:
         return re.sub(r"\s+", "", (value or "").strip().lower())
+
+    def _build_index(self, nodes: list[dict]) -> dict:
+        lookup = {node["ref"]: node for node in nodes}
+        children = self._children_map(nodes)
+
+        surface_index = []
+        deep_index = []
+        for node in nodes:
+            if node.get("semantic_level") == "surface":
+                surface_index.append(self._surface_node_summary(node, children))
+            else:
+                deep_index.append(self._deep_node_summary(node))
+
+        roots = [n["ref"] for n in nodes if not n.get("parent_ref")]
+        parent_map = {n["ref"]: n.get("parent_ref") for n in nodes if n.get("parent_ref")}
+        children_map = {}
+        for parent_ref, child_nodes in children.items():
+            children_map[parent_ref] = [c["ref"] for c in child_nodes]
+
+        interactable = [
+            {"ref": n["ref"], "role": n["role"], "name": n["name"]}
+            for n in nodes
+            if n["ref_type"] == "element" and n["visibility"]["interactable_now"]
+        ]
+
+        stats = {
+            "total_nodes": len(nodes),
+            "surface_count": len(surface_index),
+            "deep_count": len(deep_index),
+            "in_viewport": sum(1 for n in nodes if n["visibility"]["in_viewport"]),
+            "offscreen": sum(1 for n in nodes if not n["visibility"]["in_viewport"]),
+            "interactable_now": len(interactable),
+        }
+
+        index = {
+            "interactable_elements": [self._filter_empty_fields(item) for item in interactable],
+            "surface_index": [self._filter_empty_fields(item) for item in surface_index],
+            "deep_index": [self._filter_empty_fields(item) for item in deep_index],
+            "tree": {
+                "roots": roots,
+                "parent_map": parent_map,
+                "children_map": children_map,
+            },
+            "stats": stats,
+        }
+        return index
+
+    def _surface_node_summary(self, node: dict, children: dict[str, list[dict]]) -> dict:
+        return {
+            "ref": node["ref"],
+            "ref_type": node["ref_type"],
+            "tag": node["tag"],
+            "role": node["role"],
+            "name": node["name"],
+            "text": node["text"],
+            "parent_ref": node.get("parent_ref"),
+            "in_viewport": node["visibility"]["in_viewport"],
+            "interactable_now": node["visibility"]["interactable_now"],
+            "child_count": len(children.get(node["ref"], [])),
+        }
+
+    def _deep_node_summary(self, node: dict) -> dict:
+        return {
+            "ref": node["ref"],
+            "ref_type": node["ref_type"],
+            "tag": node["tag"],
+            "role": node["role"],
+            "name": node["name"][:40] if node["name"] else "",
+            "text": node["text"][:60] if node["text"] else "",
+            "parent_ref": node.get("parent_ref"),
+            "in_viewport": node["visibility"]["in_viewport"],
+        }
+
+    @staticmethod
+    def _filter_empty_fields(obj: dict) -> dict:
+        result = {}
+        for key, value in obj.items():
+            if value is None:
+                continue
+            if value == "":
+                continue
+            if value == []:
+                continue
+            if value == {}:
+                continue
+            if isinstance(value, dict):
+                filtered = CliService._filter_empty_fields(value)
+                if filtered:
+                    result[key] = filtered
+            elif isinstance(value, list):
+                filtered_list = [
+                    CliService._filter_empty_fields(item) if isinstance(item, dict) else item
+                    for item in value
+                    if item not in (None, "", [], {})
+                ]
+                if filtered_list:
+                    result[key] = filtered_list
+            else:
+                result[key] = value
+        return result

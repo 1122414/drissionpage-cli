@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 
 from dp_cli.models import RecoveryInfo
@@ -80,29 +81,202 @@ class SummaryProjector:
 class ExtractProjector:
     def project(self, group: dict, nodes: list[dict], schema: list[str] | None = None) -> dict:
         item_refs = group.get("item_refs", [])
-        items = []
-        for ref in item_refs:
-            item_nodes = [n for n in nodes if n.get("item_ref") == ref or n["ref"] == ref]
-            fields = {}
-            for node in item_nodes:
-                if node["ref_type"] == "element":
-                    key = node.get("role", "text")
-                    if key == "link" and node.get("href"):
-                        fields["href"] = node["href"]
-                    else:
-                        fields[key] = node.get("text", node.get("name", ""))
-            items.append({
-                "item_ref": ref,
-                "fields": fields,
-            })
+        lookup = {n["ref"]: n for n in nodes}
+        children_by_parent: dict[str, list[dict]] = {}
+        for node in nodes:
+            parent_ref = node.get("parent_ref")
+            if parent_ref:
+                children_by_parent.setdefault(parent_ref, []).append(node)
+
+        element_refs = [ref for ref in item_refs if lookup.get(ref, {}).get("ref_type") == "element"]
+        container_refs = [ref for ref in item_refs if lookup.get(ref, {}).get("ref_type") == "container"]
+
+        if container_refs:
+            items = self._extract_from_containers(container_refs, lookup, children_by_parent, schema)
+        elif element_refs:
+            items = self._extract_from_elements(element_refs, lookup, children_by_parent, schema)
+        else:
+            items = []
+
+        if schema:
+            normalized_schema = [s.lower() for s in schema]
+            filtered_items = []
+            for item in items:
+                filtered: dict[str, str] = {}
+                for key, value in item.items():
+                    if key.lower() in normalized_schema:
+                        schema_key = next((s for s in schema if s.lower() == key.lower()), key)
+                        filtered[schema_key] = value
+                if filtered:
+                    filtered_items.append(filtered)
+            items = filtered_items
+
+        if schema:
+            url_fields = [s for s in schema if s.lower() in ("url", "href", "link")]
+            if url_fields:
+                items = [
+                    item for item in items
+                    if any(f.lower() in [k.lower() for k in item.keys()] for f in url_fields)
+                ]
+
+        detected_schema = []
+        for item in items:
+            if item:
+                detected_schema = list(item.keys())
+                break
+
         return {
-            "target": {
-                "group_ref": group.get("group_ref", group.get("representative_ref")),
-                "group_kind": group.get("group_kind", "list"),
-            },
+            "group_ref": group.get("group_ref", group.get("representative_ref")),
+            "item_count": len(items),
+            "fields": schema if schema else detected_schema,
             "items": items,
-            "schema": schema or list(fields.keys()) if items else [],
         }
+
+    def _extract_from_containers(
+        self,
+        container_refs: list[str],
+        lookup: dict[str, dict],
+        children_by_parent: dict[str, list[dict]],
+        schema: list[str] | None,
+    ) -> list[dict[str, str]]:
+        items = []
+        for ref in container_refs:
+            collected = []
+            queue = [ref]
+            visited = set()
+            while queue:
+                current_ref = queue.pop(0)
+                if current_ref in visited:
+                    continue
+                visited.add(current_ref)
+                node = lookup.get(current_ref)
+                if node:
+                    collected.append(node)
+                    for child in children_by_parent.get(current_ref, []):
+                        if child["ref"] not in visited:
+                            queue.append(child["ref"])
+            item = self._build_item(collected, schema)
+            if item:
+                items.append(item)
+        return items
+
+    def _extract_from_elements(
+        self,
+        element_refs: list[str],
+        lookup: dict[str, dict],
+        children_by_parent: dict[str, list[dict]],
+        schema: list[str] | None,
+    ) -> list[dict[str, str]]:
+        parent_groups: dict[str, list[dict]] = {}
+        for ref in element_refs:
+            node = lookup.get(ref)
+            if not node:
+                continue
+            parent_ref = node.get("parent_ref")
+            if not parent_ref:
+                item = self._build_item([node], schema)
+                if item:
+                    parent_groups.setdefault(f"__leaf_{ref}", []).append(node)
+            else:
+                parent_groups.setdefault(parent_ref, []).append(node)
+
+        if len(parent_groups) == 1:
+            all_nodes = list(parent_groups.values())[0]
+            xpath_groups = self._group_by_xpath_row(all_nodes)
+            if len(xpath_groups) > 1:
+                parent_groups = xpath_groups
+
+        items = []
+        for _parent_ref, collected in parent_groups.items():
+            item = self._build_item(collected, schema)
+            if item:
+                items.append(item)
+        return items
+
+    def _group_by_xpath_row(self, nodes: list[dict]) -> dict[str, list[dict]]:
+        groups: dict[str, list[dict]] = {}
+        for node in nodes:
+            xpath = node.get("xpath", "")
+            parts = xpath.split("/")
+            indexed_indices = [i for i, part in enumerate(parts) if re.search(r"\[\d+\]", part)]
+
+            if len(indexed_indices) >= 2:
+                row_idx = indexed_indices[-2]
+            elif len(indexed_indices) == 1:
+                row_idx = indexed_indices[0]
+            else:
+                groups.setdefault(xpath, []).append(node)
+                continue
+
+            key = "/".join(parts[: row_idx + 1])
+            groups.setdefault(key, []).append(node)
+
+        return groups
+
+    def _build_item(self, nodes: list[dict], schema: list[str] | None) -> dict[str, str] | None:
+        item: dict[str, str] = {}
+
+        url_field = "url"
+        title_field = "title"
+        if schema:
+            for field in schema:
+                if field.lower() in ("url", "href", "link"):
+                    url_field = field
+                if field.lower() in ("title", "name", "text"):
+                    title_field = field
+
+        def node_priority(node: dict) -> tuple:
+            href = node.get("href", "")
+            is_external = href.startswith("http://") or href.startswith("https://")
+            is_noise = any(
+                pattern in href
+                for pattern in ["vote?", "from?site=", "goto=news", "hide?", "flag?"]
+            )
+            text_len = len(node.get("text", ""))
+            return (
+                0 if is_external and not is_noise else (2 if is_noise else 1),
+                -text_len,
+            )
+
+        sorted_nodes = sorted(nodes, key=node_priority)
+
+        for node in sorted_nodes:
+            href = node.get("href", "")
+            if href.startswith("http://") or href.startswith("https://"):
+                item[url_field] = href
+                break
+
+        title_candidates = []
+        for node in sorted_nodes:
+            text = node.get("text") or node.get("name", "")
+            if text and len(text) > 3:
+                title_candidates.append(text)
+
+        if title_candidates:
+            item[title_field] = max(title_candidates, key=len)
+
+        for node in sorted_nodes:
+            text = node.get("text") or node.get("name", "")
+            role = node.get("role", "")
+
+            if "author" in (schema or []) and not item.get("author"):
+                if role == "link" and text and len(text) <= 30 and " " not in text:
+                    item["author"] = text
+
+            if "points" in (schema or []) and not item.get("points"):
+                if text and ("point" in text.lower() or re.match(r"\d+\s*points?", text, re.IGNORECASE)):
+                    item["points"] = text
+
+        has_url = bool(item.get(url_field))
+        has_title = bool(item.get(title_field)) and len(item[title_field]) > 5
+
+        if not has_url and not has_title:
+            return None
+
+        if item.get(url_field) and not item.get(title_field):
+            item[title_field] = item[url_field]
+
+        return item
 
 
 class TokenBudgetEnforcer:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import socket
 import subprocess
@@ -13,6 +14,7 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from dp_cli.models import score_text_match
 from dp_cli.session import SessionManager
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -84,11 +86,10 @@ def snapshot_nodes(snapshot: dict) -> list[dict]:
     data = snapshot["data"]
     if "nodes" in data:
         return data["nodes"]
-    planner_view = data.get("planner_view") or {}
+    index = data.get("index") or {}
     return [
-        *planner_view.get("pinned_controls", []),
-        *planner_view.get("viewport_nodes", []),
-        *planner_view.get("condensed_groups", []),
+        *index.get("surface_index", []),
+        *index.get("deep_index", []),
     ]
 
 
@@ -103,11 +104,11 @@ def select_node(
 ) -> dict:
     nodes = snapshot_nodes(snapshot_or_nodes) if isinstance(snapshot_or_nodes, dict) else snapshot_or_nodes
     for node in nodes:
-        if ref_type and node["ref_type"] != ref_type:
+        if ref_type and node.get("ref_type") != ref_type:
             continue
-        if role and node["role"] != role:
+        if role and node.get("role") != role:
             continue
-        if element_id and node["id"] != element_id:
+        if element_id and node.get("id") != element_id:
             continue
         if name_contains:
             haystack = " ".join(
@@ -200,9 +201,9 @@ def run_public_smoke_workflow(session: str, url: str = "https://example.com") ->
         "clicked": clicked,
     }
 
-
 def best_text_match(nodes: list[dict], text: str) -> dict:
     target = text.strip().lower()
+    normalized_target = re.sub(r"\s+", "", target)
     ranked: list[tuple[int, dict]] = []
     for node in nodes:
         fields = [
@@ -217,19 +218,15 @@ def best_text_match(nodes: list[dict], text: str) -> dict:
         haystack = " ".join(fields).strip().lower()
         if not haystack or target not in haystack:
             continue
-        score = 0
-        if (node.get("name") or "").strip().lower() == target:
-            score += 30
-        if (node.get("text") or "").strip().lower() == target:
-            score += 25
-        if target in (node.get("name") or "").lower():
-            score += 15
-        if target in (node.get("text") or "").lower():
-            score += 10
-        if target in (node.get("label") or "").lower():
-            score += 8
-        if node.get("role") in {"button", "link"}:
-            score += 3
+        score = score_text_match(
+            node,
+            normalized_target,
+            exact_name_weight=30,
+            exact_text_weight=25,
+            sub_text_weight=10,
+            sub_label_weight=8,
+            actionable_bias=3,
+        )
         ranked.append((score, node))
     if not ranked:
         raise AssertionError(f"Could not find a matching node for text={text!r}")

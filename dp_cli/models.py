@@ -1,17 +1,60 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 DEFAULT_SESSION = "default"
 DEFAULT_PORT_START = 9333
 DEFAULT_PORT_END = 9433
-INTERACTIVE_LOCATOR = (
-    'css:a,button,input,textarea,select,summary,option,'
-    '[role="button"],[role="link"],[role="textbox"],[role="checkbox"],'
-    '[role="radio"],[role="tab"],[role="switch"],[onclick],[contenteditable="true"]'
-)
 SNAPSHOT_DEFAULT_DEPTH = 6
+
+
+def score_text_match(
+    node: dict,
+    query: str,
+    *,
+    exact_name_weight: int = 40,
+    exact_text_weight: int = 35,
+    exact_label_weight: int = 25,
+    sub_name_weight: int = 15,
+    sub_text_weight: int = 12,
+    sub_label_weight: int = 10,
+    pinned_bias: int = 0,
+    viewport_bias: int = 0,
+    interactable_bias: int = 0,
+    actionable_bias: int = 0,
+) -> int:
+    """Score how well a node matches a text query.
+
+    Callers should pass bias flags appropriate to their context.
+    Default weights match the service-side scoring in CliService._filter_text_matches.
+    """
+    score = 0
+    exact_name = re.sub(r"\s+", "", (node.get("name") or "").strip().lower())
+    exact_text = re.sub(r"\s+", "", (node.get("text") or "").strip().lower())
+    label_text = re.sub(r"\s+", "", (node.get("label") or "").strip().lower())
+    if exact_name == query:
+        score += exact_name_weight
+    if exact_text == query:
+        score += exact_text_weight
+    if label_text == query:
+        score += exact_label_weight
+    if query in exact_name:
+        score += sub_name_weight
+    if query in exact_text:
+        score += sub_text_weight
+    if query in label_text:
+        score += sub_label_weight
+    if pinned_bias and node.get("_pinned"):
+        score += pinned_bias
+    if viewport_bias and node.get("visibility", {}).get("in_viewport"):
+        score += viewport_bias
+    if interactable_bias and node.get("visibility", {}).get("interactable_now"):
+        score += interactable_bias
+    if actionable_bias and node.get("role") in {"button", "link"}:
+        score += actionable_bias
+    return score
 
 
 @dataclass
@@ -64,6 +107,7 @@ class SnapshotNodeRecord:
     checked: bool = False
     selected: bool = False
     expanded: bool = False
+    semantic_level: str = ""
     kind: str = ""
     group_ref: str | None = None
     item_ref: str | None = None
@@ -102,6 +146,8 @@ class SnapshotNodeRecord:
                 "expanded": self.expanded,
             },
         }
+        if self.semantic_level:
+            result["semantic_level"] = self.semantic_level
         if self.kind:
             result["kind"] = self.kind
         if self.group_ref:
@@ -125,7 +171,7 @@ class SnapshotArtifact:
     depth: int | None
     nodes: list[dict]
     planner_view: dict | None = None
-    schema_version: str = "0.4"
+    schema_version: str = "0.6"
     groups: list[dict] = field(default_factory=list)
     recovery: dict = field(default_factory=dict)
 

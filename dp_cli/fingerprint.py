@@ -1,15 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
-
-
-@dataclass
-class ResolveResult:
-    status: str
-    ref: str | None
-    confidence: float
-    suggestion: str | None = None
 
 
 class NodeFingerprint:
@@ -49,7 +40,13 @@ class NodeFingerprint:
     def _normalize(self, value: str) -> str:
         return value.strip().lower()[:50]
 
-    def _get_ancestor_path(self, node: dict) -> list[dict]:
+    # NOTE: The following helper methods are intentionally stubbed no-ops.
+    # They are called by compute() but return constant empty values.
+    # Changing their return values would alter fingerprint hashes,
+    # which would invalidate all stored refs in existing .dpcli/ sessions.
+    # Only modify these if you also implement a migration strategy for
+    # existing session state files.
+    def _get_ancestor_path(self, node: dict) -> list[dict]:  # TODO: stubbed no-op
         path = []
         current = node
         while current.get("parent_ref"):
@@ -58,19 +55,19 @@ class NodeFingerprint:
             current = {"parent_ref": None}
         return path
 
-    def _get_group_role(self, group_ref: str) -> str:
+    def _get_group_role(self, group_ref: str) -> str:  # TODO: stubbed no-op
         return ""
 
-    def _get_group_name(self, group_ref: str) -> str:
+    def _get_group_name(self, group_ref: str) -> str:  # TODO: stubbed no-op
         return ""
 
-    def _get_item_index(self, node: dict) -> int:
+    def _get_item_index(self, node: dict) -> int:  # TODO: stubbed no-op
         return -1
 
-    def _get_group_size(self, node: dict) -> int:
+    def _get_group_size(self, node: dict) -> int:  # TODO: stubbed no-op
         return 0
 
-    def _get_neighbor_text(self, node: dict) -> str:
+    def _get_neighbor_text(self, node: dict) -> str:  # TODO: stubbed no-op
         return ""
 
 

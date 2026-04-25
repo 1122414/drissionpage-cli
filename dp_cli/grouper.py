@@ -1,21 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
-
-@dataclass
-class GroupSchema:
-    group_ref: str
-    group_kind: str
-    name: str
-    item_refs: list[str] = field(default_factory=list)
-    sample_fields: list[str] = field(default_factory=list)
-    entry_action_refs: list[str] = field(default_factory=list)
-    next_page_ref: str | None = None
-
 
 class GroupKindDetector:
-    def detect(self, compressed_group: dict, nodes: list[dict]) -> str:
+    def detect(self, compressed_group: dict, _nodes: list[dict]) -> str:
         role = compressed_group.get("role", "")
         tag = compressed_group.get("tag", "")
         if role in {"list", "listitem"} or tag in {"ul", "ol"}:
@@ -60,13 +47,4 @@ class FieldSchemaExtractor:
         return role
 
 
-class PaginationDetector:
-    def detect(self, nodes: list[dict]) -> str | None:
-        pagination_keywords = {"next", "more", "load more", "下一页"}
-        for node in nodes:
-            if node["ref_type"] != "element":
-                continue
-            text = (node.get("text") or node.get("name") or "").lower()
-            if any(kw in text for kw in pagination_keywords):
-                return node["ref"]
-        return None
+

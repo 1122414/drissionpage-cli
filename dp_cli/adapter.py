@@ -5,79 +5,15 @@ from collections import OrderedDict
 from dp_cli.models import (
     Bounds,
     ContextInfo,
-    INTERACTIVE_LOCATOR,
-    SNAPSHOT_DEFAULT_DEPTH,
     SnapshotNodeRecord,
     Visibility,
 )
 
 BODY_LOCATOR = "xpath:/html/body"
 
-SNAPSHOT_SCRIPT = """
-function buildXPath(node) {
-  if (!node || node.nodeType !== Node.ELEMENT_NODE) {
-    return '';
-  }
-  if (node === document.body) {
-    return '/html/body';
-  }
-  const segments = [];
-  let current = node;
-  while (current && current.nodeType === Node.ELEMENT_NODE) {
-    if (current === document.documentElement) {
-      segments.unshift('html');
-      break;
-    }
-    let index = 1;
-    let sibling = current.previousElementSibling;
-    while (sibling) {
-      if (sibling.tagName === current.tagName) {
-        index += 1;
-      }
-      sibling = sibling.previousElementSibling;
-    }
-    segments.unshift(current.tagName.toLowerCase() + '[' + index + ']');
-    current = current.parentElement;
-  }
-  return '/' + segments.join('/');
-}
-
+SHARED_JS_HELPERS = """
 function compactText(value) {
   return (value || '').replace(/\\s+/g, ' ').trim();
-}
-
-function textByIds(value) {
-  if (!value) return '';
-  const texts = [];
-  for (const id of value.split(/\\s+/)) {
-    const node = document.getElementById(id);
-    if (!node) continue;
-    const text = compactText(node.innerText || node.textContent || '');
-    if (text && !texts.includes(text)) {
-      texts.push(text);
-    }
-  }
-  return texts.join(' ');
-}
-
-function associatedLabel(node) {
-  const labelledBy = textByIds(node.getAttribute('aria-labelledby'));
-  if (labelledBy) return labelledBy;
-
-  if (node.id) {
-    const escaped = window.CSS && window.CSS.escape ? window.CSS.escape(node.id) : node.id;
-    const labels = Array.from(document.querySelectorAll('label[for="' + escaped + '"]'))
-      .map((item) => compactText(item.innerText || item.textContent || ''))
-      .filter(Boolean);
-    if (labels.length) return labels.join(' ');
-  }
-
-  const wrappingLabel = node.closest('label');
-  if (wrappingLabel) {
-    const text = compactText(wrappingLabel.innerText || wrappingLabel.textContent || '');
-    if (text) return text;
-  }
-  return '';
 }
 
 function elementBounds(node) {
@@ -115,6 +51,70 @@ function isEnabled(node) {
 function hasPointerEvents(node) {
   const style = window.getComputedStyle(node);
   return !style || style.pointerEvents !== 'none';
+}
+"""
+
+SNAPSHOT_SCRIPT = SHARED_JS_HELPERS + """
+function buildXPath(node) {
+  if (!node || node.nodeType !== Node.ELEMENT_NODE) {
+    return '';
+  }
+  if (node === document.body) {
+    return '/html/body';
+  }
+  const segments = [];
+  let current = node;
+  while (current && current.nodeType === Node.ELEMENT_NODE) {
+    if (current === document.documentElement) {
+      segments.unshift('html');
+      break;
+    }
+    let index = 1;
+    let sibling = current.previousElementSibling;
+    while (sibling) {
+      if (sibling.tagName === current.tagName) {
+        index += 1;
+      }
+      sibling = sibling.previousElementSibling;
+    }
+    segments.unshift(current.tagName.toLowerCase() + '[' + index + ']');
+    current = current.parentElement;
+  }
+  return '/' + segments.join('/');
+}
+
+function textByIds(value) {
+  if (!value) return '';
+  const texts = [];
+  for (const id of value.split(/\\s+/)) {
+    const node = document.getElementById(id);
+    if (!node) continue;
+    const text = compactText(node.innerText || node.textContent || '');
+    if (text && !texts.includes(text)) {
+      texts.push(text);
+    }
+  }
+  return texts.join(' ');
+}
+
+function associatedLabel(node) {
+  const labelledBy = textByIds(node.getAttribute('aria-labelledby'));
+  if (labelledBy) return labelledBy;
+
+  if (node.id) {
+    const escaped = window.CSS && window.CSS.escape ? window.CSS.escape(node.id) : node.id;
+    const labels = Array.from(document.querySelectorAll('label[for="' + escaped + '"]'))
+      .map((item) => compactText(item.innerText || item.textContent || ''))
+      .filter(Boolean);
+    if (labels.length) return labels.join(' ');
+  }
+
+  const wrappingLabel = node.closest('label');
+  if (wrappingLabel) {
+    const text = compactText(wrappingLabel.innerText || wrappingLabel.textContent || '');
+    if (text) return text;
+  }
+  return '';
 }
 
 function explicitRole(node) {
@@ -307,20 +307,32 @@ const root = this;
 const maxDepth = arguments[0];
 const nodes = [];
 
+function computeSemanticLevel(node, depth, isSemantic, isInteractive, inViewport) {
+  if (isInteractive) return 'surface';
+  if (isSemantic && inViewport) return 'surface';
+  if (inViewport && depth <= 3) return 'surface';
+  return 'deep';
+}
+
 function pushNode(node) {
   const visible = isVisible(node);
   const inViewport = isInViewport(node);
   const interactableNow = isInteractiveNode(node) && visible && inViewport && isEnabled(node) && hasPointerEvents(node);
   if (!visible) return;
   const role = computedRole(node);
+  const isSemantic = isSemanticContainer(node);
+  const isInteractive = isInteractiveNode(node);
+  const depth = nodeDepth(root, node);
   const parent = nearestSemanticParent(root, node);
+  const semanticLevel = computeSemanticLevel(node, depth, isSemantic, isInteractive, inViewport);
+  const tag = (node.tagName || '').toLowerCase();
   nodes.push({
     xpath: buildXPath(node),
     parent_xpath: parent ? buildXPath(parent) : null,
-    ref_type: isInteractiveNode(node) ? 'element' : 'container',
-    tag: (node.tagName || '').toLowerCase(),
+    ref_type: isInteractive ? 'element' : 'container',
+    tag: tag,
     role: role,
-    name: isInteractiveNode(node) ? accessibleName(node) : namedContainer(node),
+    name: isInteractive ? accessibleName(node) : namedContainer(node),
     text: visibleText(node),
     value: node.value || '',
     element_id: node.id || '',
@@ -331,7 +343,7 @@ function pushNode(node) {
     aria_label: node.getAttribute('aria-label') || '',
     alt: node.getAttribute('alt') || '',
     label: associatedLabel(node),
-    depth: nodeDepth(root, node),
+    depth: depth,
     bounds: elementBounds(node),
     visibility: {
       visible: visible,
@@ -339,6 +351,7 @@ function pushNode(node) {
       interactable_now: interactableNow
     },
     context: contextInfo(node),
+    semantic_level: semanticLevel,
     disabled: !isEnabled(node),
     checked: !!node.checked || node.getAttribute('aria-checked') === 'true',
     selected: !!node.selected || node.getAttribute('aria-selected') === 'true',
@@ -353,56 +366,13 @@ if ((isSemanticContainer(root) || isInteractiveNode(root)) && root !== document.
 for (const node of Array.from(root.querySelectorAll('*'))) {
   const depth = nodeDepth(root, node);
   if (maxDepth !== null && maxDepth !== undefined && maxDepth >= 0 && depth > maxDepth) continue;
-  if (isSemanticContainer(node) || isInteractiveNode(node)) {
-    pushNode(node);
-  }
+  pushNode(node);
 }
 
 return nodes;
 """
 
-ELEMENT_STATE_SCRIPT = """
-function compactText(value) {
-  return (value || '').replace(/\\s+/g, ' ').trim();
-}
-
-function elementBounds(node) {
-  const rect = node.getBoundingClientRect();
-  return {
-    x: Number(rect.x.toFixed(1)),
-    y: Number(rect.y.toFixed(1)),
-    width: Number(rect.width.toFixed(1)),
-    height: Number(rect.height.toFixed(1))
-  };
-}
-
-function isVisible(node) {
-  const rect = node.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) return false;
-  const style = window.getComputedStyle(node);
-  if (!style) return true;
-  if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
-  if (style.opacity === '0') return false;
-  return true;
-}
-
-function isInViewport(node) {
-  const rect = node.getBoundingClientRect();
-  return rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
-}
-
-function isEnabled(node) {
-  if (node.disabled) return false;
-  if (node.getAttribute('disabled') !== null) return false;
-  if (node.getAttribute('aria-disabled') === 'true') return false;
-  return true;
-}
-
-function hasPointerEvents(node) {
-  const style = window.getComputedStyle(node);
-  return !style || style.pointerEvents !== 'none';
-}
-
+ELEMENT_STATE_SCRIPT = SHARED_JS_HELPERS + """
 return {
   text: compactText(this.innerText || this.textContent || ''),
   bounds: elementBounds(this),
@@ -432,16 +402,8 @@ class DrissionPageAdapter:
         payload = root.run_js(SNAPSHOT_SCRIPT, max_depth)
         return self._serialize_snapshot_payloads(payload)
 
-    def interactive_elements(self, tab) -> list[SnapshotNodeRecord]:
-        return [node for node in self.snapshot_nodes(tab, depth=None) if node.ref_type == "element"]
-
     def find_by_locator(self, tab, locator: str) -> list[SnapshotNodeRecord]:
         return self._serialize_elements(tab.eles(locator))
-
-    def find_by_text(self, tab, text: str) -> list[SnapshotNodeRecord]:
-        query = text.lower()
-        candidates = self.interactive_elements(tab)
-        return [candidate for candidate in candidates if query in self._searchable_text(candidate)]
 
     def resolve(self, tab, locator: str):
         return tab.ele(locator)
@@ -487,21 +449,4 @@ class DrissionPageAdapter:
             payload["context"] = ContextInfo(**payload["context"])
         return SnapshotNodeRecord(**payload)
 
-    def _searchable_text(self, candidate: SnapshotNodeRecord) -> str:
-        return " ".join(
-            part
-            for part in (
-                candidate.name,
-                candidate.text,
-                candidate.label,
-                candidate.value,
-                candidate.placeholder,
-                candidate.href,
-                candidate.element_id,
-                candidate.title,
-                candidate.aria_label,
-                candidate.context.heading,
-                candidate.context.landmark,
-            )
-            if part
-        ).lower()
+
