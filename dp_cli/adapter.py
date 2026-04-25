@@ -405,7 +405,7 @@ class DrissionPageAdapter:
         return self._serialize_snapshot_payloads(payload)
 
     def find_by_locator(self, tab, locator: str) -> list[SnapshotNodeRecord]:
-        return self._serialize_elements(tab.eles(locator))
+        return self._serialize_elements(tab.eles(locator), require_element_type=False)
 
     def resolve(self, tab, locator: str):
         return tab.ele(locator)
@@ -422,12 +422,14 @@ class DrissionPageAdapter:
     def type_text(self, element, text: str) -> None:
         element.input(text, clear=True)
 
-    def _serialize_elements(self, elements) -> list[SnapshotNodeRecord]:
+    def _serialize_elements(self, elements, require_element_type: bool = True) -> list[SnapshotNodeRecord]:
         records: OrderedDict[str, SnapshotNodeRecord] = OrderedDict()
         for element in elements:
             payload = element.run_js(SNAPSHOT_SCRIPT, 0)
             for item in payload if isinstance(payload, list) else [payload]:
-                if not item or not item.get("xpath") or item.get("ref_type") != "element":
+                if not item or not item.get("xpath"):
+                    continue
+                if require_element_type and item.get("ref_type") != "element":
                     continue
                 record = self._snapshot_record(item)
                 records[record.xpath] = record

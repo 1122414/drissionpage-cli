@@ -32,7 +32,8 @@ SCENARIOS = {
     # 或使用 --dry-run 快速查看页面 index 结构而不调用 LLM
     # "automation": "打开 https://www.baidu.com，在搜索框输入'python tutorial'，点击搜索按钮",
     # "crawler_list": "访问 https://news.ycombinator.com，提取前5条新闻的标题和链接",
-    "hybrid": "去 https://www.libvio.mov/ 搜索进击的巨人，并播放第一季的第五集",
+    # "hybrid": "去 https://www.libvio.mov/ 搜索进击的巨人，并播放第一季的第五集",
+    "hybrid": "去 https://www.mtyy1.com/ 搜索进击的巨人，并播放第一季的第五集",
 }
 
 
@@ -220,6 +221,33 @@ class DPCLIAgent:
         self.history: list[dict[str, Any]] = []
         self.total_tokens = 0
         self.collected_items: list[dict] = []
+        self.recent_actions: list[dict[str, Any]] = []
+
+    def _record_action(self, skill: str, params: dict[str, Any], result: dict[str, Any]) -> None:
+        ok = result.get("ok", False)
+        self.recent_actions.append({
+            "skill": skill,
+            "params": self._safe_params(skill, params),
+            "ok": ok,
+        })
+        if len(self.recent_actions) > 3:
+            self.recent_actions.pop(0)
+
+    def _safe_params(self, skill: str, params: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(params, dict):
+            return {}
+        safe: dict[str, Any] = {}
+        if skill in ("type", "click", "expand", "extract", "list-items") and "ref" in params:
+            safe["ref"] = params["ref"]
+        if skill == "type" and "text" in params:
+            safe["text"] = params["text"]
+        if skill == "open" and "url" in params:
+            safe["url"] = params["url"]
+        if skill == "find" and "text" in params:
+            safe["text"] = params["text"]
+        if skill == "find" and "locator" in params:
+            safe["locator"] = params["locator"]
+        return safe
 
     def plan_goal(self, goal: str) -> dict[str, Any]:
         prompt = (
@@ -259,20 +287,21 @@ class DPCLIAgent:
             "3. REQUIRED: If not in interactable_elements, check 'surface_index'. If found, use its ref.\n"
             "4. REQUIRED: If not in surface_index, use 'find' with --text or --locator. find searches ALL visible elements.\n"
             "5. REQUIRED: 'type' and 'click' MUST use 'ref' param whenever possible. Only use 'locator' as last resort.\n"
-            "6. If a click causes 'ref_stale' error, the page navigated — take a new snapshot immediately.\n\n"
+            "6. If a click causes 'ref_stale' error, the page navigated — take a new snapshot immediately.\n"
+            "7. NEVER REPEAT the same action consecutively. If you just typed text successfully (ok=true), do NOT type again — proceed to click the submit/search button.\n\n"
             "STANDARD INTERACTION WORKFLOW (memorize this):\n"
             "Step A: snapshot → get index\n"
             "Step B: Check interactable_elements → click/type by ref if found\n"
             "Step C: Check surface_index → click/type by ref if found\n"
             "Step D: Target not visible → find --text '关键词' or find --locator 'css-selector'\n"
-            "Step E: type --ref eXX --text 'keyword' → click --ref eYY\n"
+            "Step E: type --ref eXX --text 'keyword' → IMMEDIATELY click --ref eYY (submit/search)\n"
             "Step F: After page change → snapshot again to get fresh refs\n\n"
             "Example: To search for '进击的巨人' on a site:\n"
             "  1. snapshot → check interactable_elements for search input\n"
             "  2. Not found? check surface_index for search-related elements\n"
             "  3. Still not found? find --text '搜索' or find --locator 'input[placeholder*=搜索]'\n"
             "  4. type --ref e13 --text '进击的巨人'\n"
-            "  5. find --text '搜索' (find search button ref) → click --ref e14\n"
+            "  5. IMMEDIATELY click --ref e14 (search/submit button) — do NOT type again\n"
             "  6. snapshot (page changed, get new refs)\n\n"
             "WHEN TO USE eval (rare):\n"
             "- ONLY when you need to extract complex data that 'extract' cannot handle\n"
@@ -284,6 +313,7 @@ class DPCLIAgent:
             '- type: {"skill": "type", "params": {"ref": "e12", "text": "进击的巨人"}}\n'
             '- click: {"skill": "click", "params": {"ref": "e13"}}\n'
             '- extract: {"skill": "extract", "params": {"target_ref": "r2", "schema": ["title", "url"], "limit": 5}}\n\n'
+            "recent_actions shows your last 3 actions. If the last action was type/click with ok=true, you MUST choose a DIFFERENT next action (do NOT repeat).\n\n"
             "Choose the next action based on the current state and goal.\n\n"
             'Return JSON with:\n'
             '- "thought": your reasoning (keep it short, 1-2 sentences)\n'
@@ -470,12 +500,15 @@ class DPCLIAgent:
                 for ref, children in children_map.items()
                 if isinstance(children, list) and len(children) > 20
             ]
-            if large_containers:
-                result["large_containers"] = large_containers[:5]
+        if large_containers:
+            result["large_containers"] = large_containers[:5]
+
+        if self.recent_actions:
+            result["recent_actions"] = self.recent_actions[-3:]
 
         return result
 
-    def run(self, goal: str, max_steps: int = 10) -> AgentReport:
+    def run(self, goal: str, max_steps: int = 20) -> AgentReport:
         report = AgentReport(scenario="", goal=goal)
         start_time = time.time()
 
@@ -556,6 +589,7 @@ class DPCLIAgent:
 
                 print(f"[Agent] Step {step}: {skill} - {action.get('reason', '')}")
                 result = self.execute_skill(skill, action.get("params") or {})
+                self._record_action(skill, action.get("params") or {}, result)
 
                 err = result.get("error")
                 if isinstance(err, dict):
@@ -655,7 +689,7 @@ class TestRunner:
         self.results: list[AgentReport] = []
         self.headless = headless
 
-    def run_scenario(self, name: str, goal: str, max_steps: int = 10) -> AgentReport:
+    def run_scenario(self, name: str, goal: str, max_steps: int = 20) -> AgentReport:
         print(f"\n{'='*60}")
         print(f"Scenario: {name}")
         print(f"Goal: {goal}")
