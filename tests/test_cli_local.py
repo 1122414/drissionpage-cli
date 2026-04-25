@@ -279,6 +279,25 @@ def test_snapshot_index_keeps_navigation_and_pagination_visible_to_agent(local_f
         cleanup_session(local_session)
 
 
+def test_find_locator_finds_icon_search_element(local_fixture_server, local_session):
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+
+        found = run_cli("find", "--session", local_session, "--headless", "--locator", ".icon-search")
+        assert found["ok"] is True
+        assert found["data"]["count"] >= 1
+        icon_elements = [
+            node for node in found["data"]["nodes"]
+            if node.get("tag") == "i" and "icon-search" in (node.get("id") or "")
+        ]
+        assert len(icon_elements) >= 1
+        icon = icon_elements[0]
+        assert icon["ref_type"] == "element"
+        assert icon.get("role") in ("link", "button", "generic", "")
+    finally:
+        cleanup_session(local_session)
+
+
 def test_find_and_click_can_operate_on_offscreen_pagination(local_fixture_server, local_session):
     try:
         run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")

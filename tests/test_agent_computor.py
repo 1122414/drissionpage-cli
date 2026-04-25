@@ -238,12 +238,13 @@ class DPCLIAgent:
             return False
         if not self.recent_actions:
             return False
-        last = self.recent_actions[-1]
-        if last.get("skill") != skill:
-            return False
         safe = self._safe_params(skill, params)
-        last_safe = last.get("params", {})
-        return safe == last_safe
+        if not safe:
+            return False
+        for prev in reversed(self.recent_actions):
+            if prev.get("skill") == skill and prev.get("params") == safe:
+                return True
+        return False
 
     def _safe_params(self, skill: str, params: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(params, dict):
@@ -251,14 +252,14 @@ class DPCLIAgent:
         safe: dict[str, Any] = {}
         if skill in ("type", "click", "expand", "extract", "list-items") and "ref" in params:
             safe["ref"] = params["ref"]
+        if skill in ("click", "find") and "locator" in params:
+            safe["locator"] = params["locator"]
         if skill == "type" and "text" in params:
             safe["text"] = params["text"]
         if skill == "open" and "url" in params:
             safe["url"] = params["url"]
         if skill == "find" and "text" in params:
             safe["text"] = params["text"]
-        if skill == "find" and "locator" in params:
-            safe["locator"] = params["locator"]
         return safe
 
     def plan_goal(self, goal: str) -> dict[str, Any]:
@@ -1057,6 +1058,61 @@ def test_compact_state_non_dict():
     print("  PASSED: compact_state handles nested nulls")
 
     print("All compact_state guard tests passed!")
+
+
+def test_is_duplicate_action():
+    from unittest.mock import MagicMock
+
+    agent = DPCLIAgent(llm=MagicMock(), executor=MagicMock())
+
+    # Empty recent_actions
+    assert agent._is_duplicate_action("type", {"ref": "e12", "text": "hello"}) is False
+    print("  PASSED: empty history is not duplicate")
+
+    # Same action repeated
+    agent._record_action("type", {"ref": "e12", "text": "hello"}, {"ok": True})
+    assert agent._is_duplicate_action("type", {"ref": "e12", "text": "hello"}) is True
+    print("  PASSED: same type action is duplicate")
+
+    # Different text
+    assert agent._is_duplicate_action("type", {"ref": "e12", "text": "world"}) is False
+    print("  PASSED: different text is not duplicate")
+
+    # Different ref
+    assert agent._is_duplicate_action("type", {"ref": "e13", "text": "hello"}) is False
+    print("  PASSED: different ref is not duplicate")
+
+    # Different skill
+    assert agent._is_duplicate_action("click", {"ref": "e12"}) is False
+    print("  PASSED: different skill is not duplicate")
+
+    # Snapshot is exempt
+    agent._record_action("snapshot", {"mode": "agent_summary"}, {"ok": True})
+    assert agent._is_duplicate_action("snapshot", {"mode": "agent_summary"}) is False
+    print("  PASSED: snapshot is exempt")
+
+    # Open is exempt
+    assert agent._is_duplicate_action("open", {"url": "https://example.com"}) is False
+    print("  PASSED: open is exempt")
+
+    # Locator-only click is not duplicate if locator differs
+    agent.recent_actions.clear()
+    agent._record_action("click", {"locator": "#btn1"}, {"ok": True})
+    assert agent._is_duplicate_action("click", {"locator": "#btn2"}) is False
+    print("  PASSED: different locator is not duplicate")
+
+    # Same locator is duplicate
+    assert agent._is_duplicate_action("click", {"locator": "#btn1"}) is True
+    print("  PASSED: same locator is duplicate")
+
+    # Bypass via snapshot in between (should still detect across last 3)
+    agent.recent_actions.clear()
+    agent._record_action("type", {"ref": "e12", "text": "hello"}, {"ok": True})
+    agent._record_action("snapshot", {"mode": "agent_summary"}, {"ok": True})
+    assert agent._is_duplicate_action("type", {"ref": "e12", "text": "hello"}) is True
+    print("  PASSED: type after snapshot is still duplicate")
+
+    print("All _is_duplicate_action tests passed!")
 
 
 if __name__ == "__main__":
