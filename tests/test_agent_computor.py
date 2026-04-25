@@ -222,6 +222,39 @@ class DPCLIAgent:
         self.total_tokens = 0
         self.collected_items: list[dict] = []
         self.recent_actions: list[dict[str, Any]] = []
+        self.last_results: list[dict[str, Any]] = []
+
+    def _record_result(self, skill: str, result: dict[str, Any]) -> None:
+        if not result.get("ok"):
+            return
+        data = result.get("data") or {}
+        record: dict[str, Any] = {"skill": skill}
+        if skill == "find":
+            nodes = data.get("nodes", [])
+            record["count"] = data.get("count", 0)
+            record["nodes"] = [
+                {"ref": n.get("ref"), "role": n.get("role"), "name": n.get("name")}
+                for n in nodes[:5]
+                if isinstance(n, dict)
+            ]
+        elif skill == "click":
+            record["target"] = data.get("target", {})
+        elif skill == "type":
+            record["typed_text"] = data.get("typed_text", "")
+            record["target"] = data.get("target", {})
+        elif skill == "extract":
+            items = data.get("items", [])
+            record["item_count"] = len(items)
+            record["fields"] = data.get("fields", [])
+        elif skill == "eval":
+            record["result_preview"] = str(data.get("result", ""))[:120]
+        elif skill == "snapshot":
+            record["url"] = (data.get("page") or {}).get("url")
+            record["title"] = (data.get("page") or {}).get("title")
+        if len(record) > 1:
+            self.last_results.append(record)
+            if len(self.last_results) > 5:
+                self.last_results.pop(0)
 
     def _record_action(self, skill: str, params: dict[str, Any], result: dict[str, Any]) -> None:
         ok = result.get("ok", False)
@@ -334,7 +367,8 @@ class DPCLIAgent:
             '- type: {"skill": "type", "params": {"ref": "e12", "text": "进击的巨人"}}\n'
             '- click: {"skill": "click", "params": {"ref": "e13"}}\n'
             '- extract: {"skill": "extract", "params": {"target_ref": "r2", "schema": ["title", "url"], "limit": 5}}\n\n'
-            "recent_actions shows your last 3 actions. If the last action was type/click with ok=true, you MUST choose a DIFFERENT next action (do NOT repeat).\n\n"
+            "recent_actions shows your last 3 actions. If the last action was type/click with ok=true, you MUST choose a DIFFERENT next action (do NOT repeat).\n"
+            "last_results shows the outcomes of your last 5 successful operations. If you previously used find and got results, those refs are still valid — you do NOT need to find again. Use the refs from last_results directly.\n\n"
             "Choose the next action based on the current state and goal.\n\n"
             'Return JSON with:\n'
             '- "thought": your reasoning (keep it short, 1-2 sentences)\n'
@@ -527,6 +561,9 @@ class DPCLIAgent:
         if self.recent_actions:
             result["recent_actions"] = self.recent_actions[-3:]
 
+        if self.last_results:
+            result["last_results"] = self.last_results[-5:]
+
         return result
 
     def run(self, goal: str, max_steps: int = 20) -> AgentReport:
@@ -618,6 +655,7 @@ class DPCLIAgent:
                 else:
                     result = self.execute_skill(skill, params)
                 self._record_action(skill, params, result)
+                self._record_result(skill, result)
 
                 err = result.get("error")
                 if isinstance(err, dict):
