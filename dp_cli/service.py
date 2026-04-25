@@ -613,9 +613,9 @@ class CliService:
             children_map[parent_ref] = [c["ref"] for c in child_nodes]
 
         interactable = [
-            {"ref": n["ref"], "role": n["role"], "name": n["name"], "in_viewport": n["visibility"]["in_viewport"]}
+            {"ref": n["ref"], "role": n["role"], "name": n["name"]}
             for n in nodes
-            if n["ref_type"] == "element" and n["role"] in {"button", "link", "textbox", "checkbox", "radio", "combobox", "slider", "spinbutton", "switch", "tab"}
+            if n["ref_type"] == "element" and n["visibility"]["interactable_now"]
         ]
 
         stats = {

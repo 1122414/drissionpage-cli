@@ -307,10 +307,12 @@ const root = this;
 const maxDepth = arguments[0];
 const nodes = [];
 
-function computeSemanticLevel(node, depth, isSemantic, isInteractive, inViewport, role) {
+function computeSemanticLevel(node, depth, isSemantic, isInteractive, inViewport, interactableNow, role) {
+  if (interactableNow) return 'surface';
   const dataContainerRoles = {'table': true, 'list': true, 'grid': true, 'rowgroup': true, 'row': true};
   if (dataContainerRoles[role]) return 'surface';
   if (isSemantic && inViewport) return 'surface';
+  if (inViewport && depth <= 3) return 'surface';
   return 'deep';
 }
 
@@ -324,7 +326,7 @@ function pushNode(node) {
   const isInteractive = isInteractiveNode(node);
   const depth = nodeDepth(root, node);
   const parent = nearestSemanticParent(root, node);
-  const semanticLevel = computeSemanticLevel(node, depth, isSemantic, isInteractive, inViewport, role);
+  const semanticLevel = computeSemanticLevel(node, depth, isSemantic, isInteractive, inViewport, interactableNow, role);
   const tag = (node.tagName || '').toLowerCase();
   nodes.push({
     xpath: buildXPath(node),

@@ -122,8 +122,12 @@ def select_node(
             )
             if name_contains not in haystack:
                 continue
-        if interactable_now is not None and node["visibility"]["interactable_now"] != interactable_now:
-            continue
+        if interactable_now is not None:
+            node_interactable = node.get("interactable_now")
+            if node_interactable is None:
+                node_interactable = node.get("visibility", {}).get("interactable_now")
+            if node_interactable != interactable_now:
+                continue
         return node
     raise AssertionError(
         f"Could not find node ref_type={ref_type!r} role={role!r} element_id={element_id!r} "
