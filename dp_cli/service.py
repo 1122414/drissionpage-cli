@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import Callable
 from contextlib import contextmanager
+from urllib.parse import urljoin
 
 from dp_cli.adapter import DrissionPageAdapter
 from dp_cli.compressor import CompressedGroup, CompressionConfig, DOMCompressor
@@ -439,6 +440,10 @@ class CliService:
                 raise ElementNotFoundError(element_error_message, {"locator": target_locator})
             state = self._ensure_element_interactable(element, target_locator)
             action(element, text)
+            try:
+                state = self.adapter.element_state(element)
+            except Exception:
+                state = {**state, "state_after_action_unavailable": True}
             runtime.sync_page_identity()
             runtime.persist()
             return include_payload(runtime, target_locator, state)
@@ -466,16 +471,23 @@ class CliService:
             haystack = self._searchable_text(node)
             if normalized_query not in haystack:
                 continue
-            node["_pinned"] = self._is_pinned_control(node, lookup, children)
+            # Work on a copy to avoid mutating persisted state
+            node_copy = dict(node)
+            node_copy["_pinned"] = self._is_pinned_control(node, lookup, children)
             score = score_text_match(
-                node,
+                node_copy,
                 normalized_query,
                 pinned_bias=20,
                 viewport_bias=5,
                 interactable_bias=5,
+                native_tag_bias=10,
             )
-            del node["_pinned"]
-            matches.append((score, node))
+            # Mark exact text matches so callers can distinguish precise targets from container parents
+            node_copy["exact_match"] = (
+                self._normalized(node.get("text", "")) == normalized_query
+                or self._normalized(node.get("name", "")) == normalized_query
+            )
+            matches.append((score, node_copy))
         matches.sort(key=lambda item: item[0], reverse=True)
         return [node for _, node in matches]
 
@@ -591,19 +603,31 @@ class CliService:
         )
 
     def _normalized(self, value: str) -> str:
-        return re.sub(r"\s+", "", (value or "").strip().lower())
+        text = re.sub(r"\s+", "", (value or "").strip().lower())
+        # Normalize leading zeros in numbers so "第05集" matches "第5集"
+        return re.sub(r"(?<!\d)0+(\d)", r"\1", text)
 
     def _build_index(self, nodes: list[dict]) -> dict:
         lookup = {node["ref"]: node for node in nodes}
         children = self._children_map(nodes)
+        data_regions = self._detect_data_regions(nodes)
+        data_region_lookup = {region["ref"]: region for region in data_regions}
+        for node in nodes:
+            region = data_region_lookup.get(node["ref"])
+            if region:
+                node["_data_region_item_count"] = region["item_count"]
 
-        surface_index = []
-        deep_index = []
+        surface_nodes = []
+        deep_nodes = []
         for node in nodes:
             if node.get("semantic_level") == "surface":
-                surface_index.append(self._surface_node_summary(node, children))
+                surface_nodes.append(node)
             else:
-                deep_index.append(self._deep_node_summary(node))
+                deep_nodes.append(node)
+
+        surface_nodes = self._rank_index_nodes(surface_nodes, lookup)
+        surface_index = [self._surface_node_summary(node, children) for node in surface_nodes]
+        deep_index = [self._deep_node_summary(node) for node in deep_nodes]
 
         roots = [n["ref"] for n in nodes if not n.get("parent_ref")]
         parent_map = {n["ref"]: n.get("parent_ref") for n in nodes if n.get("parent_ref")}
@@ -611,11 +635,16 @@ class CliService:
         for parent_ref, child_nodes in children.items():
             children_map[parent_ref] = [c["ref"] for c in child_nodes]
 
-        interactable = [
-            {"ref": n["ref"], "role": n["role"], "name": n["name"]}
-            for n in nodes
-            if n["ref_type"] == "element" and n["visibility"]["interactable_now"]
-        ]
+        interactable_nodes = self._rank_index_nodes(
+            [
+                n
+                for n in nodes
+                if n["ref_type"] == "element" and n["visibility"]["interactable_now"]
+                and not self._is_redundant_action_parent(n, children)
+            ],
+            lookup,
+        )
+        interactable = [self._interactable_node_summary(n) for n in interactable_nodes]
 
         stats = {
             "total_nodes": len(nodes),
@@ -628,6 +657,7 @@ class CliService:
 
         index = {
             "interactable_elements": [self._filter_empty_fields(item) for item in interactable],
+            "data_regions": [self._filter_empty_fields(item) for item in data_regions],
             "surface_index": [self._filter_empty_fields(item) for item in surface_index],
             "deep_index": [self._filter_empty_fields(item) for item in deep_index],
             "tree": {
@@ -639,6 +669,162 @@ class CliService:
         }
         return index
 
+    def _detect_data_regions(self, nodes: list[dict]) -> list[dict]:
+        containers = [node for node in nodes if node.get("ref_type") == "container" and node.get("xpath")]
+        item_links = [node for node in nodes if self._is_extractable_item_link(node)]
+        if not item_links:
+            return []
+
+        candidates = []
+        for container in containers:
+            xpath = container["xpath"]
+            descendant_links = [
+                link
+                for link in item_links
+                if link.get("xpath", "").startswith(xpath + "/")
+            ]
+            if len(descendant_links) < 3:
+                continue
+            samples = [
+                {
+                    "text": link.get("text") or link.get("name"),
+                    "url": self._absolute_href(link),
+                }
+                for link in descendant_links[:3]
+            ]
+            candidates.append(
+                {
+                    "ref": container["ref"],
+                    "ref_type": container["ref_type"],
+                    "tag": container.get("tag"),
+                    "role": container.get("role"),
+                    "name": container.get("name"),
+                    "item_count": len(descendant_links),
+                    "sample_items": samples,
+                    "_depth": container.get("depth", 0),
+                    "_text_len": len(container.get("text") or ""),
+                }
+            )
+
+        if not candidates:
+            return []
+
+        # Prefer the smallest deep container that still covers many detail links.
+        candidates.sort(key=lambda item: (-item["_depth"], item["_text_len"], -item["item_count"]))
+        selected = []
+        seen_refs = set()
+        for candidate in candidates:
+            if candidate["ref"] in seen_refs:
+                continue
+            seen_refs.add(candidate["ref"])
+            candidate = dict(candidate)
+            candidate.pop("_depth", None)
+            candidate.pop("_text_len", None)
+            selected.append(candidate)
+            if len(selected) >= 5:
+                break
+        return selected
+
+    def _is_extractable_item_link(self, node: dict) -> bool:
+        if node.get("ref_type") != "element" or node.get("role") != "link":
+            return False
+        href = (node.get("href") or "").lower()
+        text = (node.get("text") or node.get("name") or "").strip()
+        if not href or len(text) < 2:
+            return False
+        if any(token in href for token in ("detail", "/vod/", "/movie/", "/video/", "/item/")):
+            return True
+        if any(token in href for token in ("vod-show", "vod-type", "year-", "area-", "by-", "class-", "page-")):
+            return False
+        if text in {"首页", "上一页", "下一页", "尾页", "全部"} or re.fullmatch(r"\d+", text):
+            return False
+        return False
+
+    def _absolute_href(self, node: dict) -> str:
+        href = node.get("href") or ""
+        return urljoin(node.get("url") or "", href)
+
+    def _is_redundant_action_parent(self, node: dict, children: dict[str, list[dict]]) -> bool:
+        if node.get("role") != "button" or node.get("tag") not in {"div", "span"}:
+            return False
+        text = self._normalized(" ".join(part for part in (node.get("name"), node.get("text")) if part))
+        if not text:
+            return False
+        for descendant in self._descendant_elements(node["ref"], children):
+            if descendant is node:
+                continue
+            if descendant.get("role") != "button":
+                continue
+            descendant_text = self._normalized(
+                " ".join(part for part in (descendant.get("name"), descendant.get("text")) if part)
+            )
+            if descendant_text == text:
+                return True
+        return False
+
+    def _rank_index_nodes(self, nodes: list[dict], lookup: dict[str, dict]) -> list[dict]:
+        return [
+            node
+            for _, node in sorted(
+                enumerate(nodes),
+                key=lambda item: (-self._planner_node_priority(item[1], lookup), item[0]),
+            )
+        ]
+
+    def _planner_node_priority(self, node: dict, lookup: dict[str, dict]) -> int:
+        score = 0
+        role = node.get("role") or ""
+        tag = node.get("tag") or ""
+        visibility = node.get("visibility") or {}
+        if visibility.get("in_viewport"):
+            score += 20
+        if visibility.get("interactable_now"):
+            score += 50
+        if role == "dialog" or self._has_ancestor_role(node, lookup, {"dialog"}):
+            score += 1000
+        if self._has_ancestor_role(node, lookup, {"form", "search"}):
+            score += 120
+        if role in {"tab", "button", "link", "textbox", "checkbox", "radio", "switch", "combobox", "option"}:
+            score += 180
+        if role == "tab":
+            score += 80
+        if role == "checkbox":
+            score += 160
+        if tag in {"button", "a", "input", "textarea", "select"}:
+            score += 40
+        if role == "button" and tag == "span":
+            score += 90
+        if role == "button" and tag == "div":
+            score -= 60
+        if node.get("_data_region_item_count"):
+            score += 700 + min(int(node.get("_data_region_item_count") or 0), 100) + int(node.get("depth") or 0) * 20
+        text = self._normalized(" ".join(part for part in (node.get("name"), node.get("text"), node.get("label")) if part))
+        if any(keyword in text for keyword in ("验证码", "获取验证码", "发送验证码", "同意", "协议", "隐私", "条款")):
+            score += 120
+        if text in {"注册", "提交", "确认"} and role == "button":
+            score += 40
+        if node.get("states", {}).get("selected") or node.get("states", {}).get("expanded"):
+            score += 30
+        if text:
+            score += 20
+        return score
+
+    def _interactable_node_summary(self, node: dict) -> dict:
+        summary = {
+            "ref": node["ref"],
+            "role": node["role"],
+            "name": node["name"],
+            "tag": node.get("tag"),
+            "text": node.get("text"),
+            "placeholder": node.get("placeholder"),
+            "label": node.get("label"),
+            "input_type": node.get("input_type"),
+            "value": node.get("value"),
+            "checked": node.get("states", {}).get("checked"),
+            "selected": node.get("states", {}).get("selected"),
+        }
+        return self._filter_empty_fields(summary)
+
     def _surface_node_summary(self, node: dict, children: dict[str, list[dict]]) -> dict:
         return {
             "ref": node["ref"],
@@ -648,9 +834,14 @@ class CliService:
             "name": node["name"],
             "text": node["text"],
             "parent_ref": node.get("parent_ref"),
+            "placeholder": node.get("placeholder"),
+            "label": node.get("label"),
+            "input_type": node.get("input_type"),
+            "value": node.get("value"),
             "in_viewport": node["visibility"]["in_viewport"],
             "interactable_now": node["visibility"]["interactable_now"],
             "child_count": len(children.get(node["ref"], [])),
+            "item_count": node.get("_data_region_item_count"),
         }
 
     def _deep_node_summary(self, node: dict) -> dict:

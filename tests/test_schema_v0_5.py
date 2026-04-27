@@ -10,6 +10,7 @@ from dp_cli.models import (
     SnapshotArtifact,
     SnapshotNodeRecord,
     Visibility,
+    score_text_match,
 )
 
 
@@ -116,7 +117,7 @@ class TestSnapshotArtifactV5:
             depth=None,
             nodes=[],
         )
-        assert artifact.schema_version == "0.4"
+        assert artifact.schema_version == "0.6"
         assert artifact.groups == []
         assert artifact.recovery == {}
 
@@ -137,3 +138,29 @@ class TestSnapshotArtifactV5:
         assert output["schema_version"] == "0.5"
         assert output["groups"] == [{"group_ref": "r10", "group_kind": "list"}]
         assert output["recovery"] == {"truncated": True}
+
+
+class TestScoreTextMatchLeadingZero:
+    def test_leading_zero_match(self):
+        node = {"name": "第05集", "text": "", "label": "", "visibility": {}, "_pinned": False}
+        assert score_text_match(node, "第5集") > 0
+        assert score_text_match(node, "第05集") > 0
+
+    def test_multiple_leading_zeros(self):
+        node = {"name": "第001集", "text": "", "label": "", "visibility": {}, "_pinned": False}
+        assert score_text_match(node, "第1集") > 0
+
+    def test_no_false_match_on_mid_number_zero(self):
+        node = {"name": "第10集", "text": "", "label": "", "visibility": {}, "_pinned": False}
+        assert score_text_match(node, "第10集") > 0
+        assert score_text_match(node, "第1集") == 0
+
+    def test_episode_text_field_match(self):
+        node = {"name": "", "text": "Episode 05", "label": "", "visibility": {}, "_pinned": False}
+        assert score_text_match(node, "episode5") > 0
+        assert score_text_match(node, "episode05") > 0
+
+    def test_reverse_direction_node_without_zero_query_with_zero(self):
+        node = {"name": "第5集", "text": "", "label": "", "visibility": {}, "_pinned": False}
+        assert score_text_match(node, "第05集") > 0
+        assert score_text_match(node, "第5集") > 0

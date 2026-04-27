@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urljoin
 
 from dp_cli.models import RecoveryInfo
 
@@ -167,6 +168,10 @@ class ExtractProjector:
         children_by_parent: dict[str, list[dict]],
         schema: list[str] | None,
     ) -> list[dict[str, str]]:
+        link_items = self._extract_link_items(element_refs, lookup, schema)
+        if link_items:
+            return link_items
+
         parent_groups: dict[str, list[dict]] = {}
         for ref in element_refs:
             node = lookup.get(ref)
@@ -192,6 +197,70 @@ class ExtractProjector:
             if item:
                 items.append(item)
         return items
+
+    def _extract_link_items(
+        self,
+        element_refs: list[str],
+        lookup: dict[str, dict],
+        schema: list[str] | None,
+    ) -> list[dict[str, str]]:
+        links = []
+        for ref in element_refs:
+            node = lookup.get(ref)
+            if not node or node.get("role") != "link" or not node.get("href"):
+                continue
+            text = node.get("text") or node.get("name") or ""
+            if not text or self._is_navigation_or_filter_link(node):
+                continue
+            links.append(node)
+
+        item_links = [node for node in links if self._is_item_detail_link(node)]
+        if len(item_links) >= 2:
+            links = item_links
+        elif len(links) < 3:
+            return []
+
+        items = []
+        seen: set[str] = set()
+        for node in links:
+            item = self._build_item([node], schema)
+            if not item:
+                continue
+            signature = "|".join(str(item.get(key, "")) for key in ("url", "href", "link", "title", "name", "text"))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            items.append(item)
+        return items
+
+    def _is_item_detail_link(self, node: dict) -> bool:
+        href = (node.get("href") or "").lower()
+        return any(token in href for token in ("detail", "/vod/", "/movie/", "/video/", "/item/"))
+
+    def _is_navigation_or_filter_link(self, node: dict) -> bool:
+        href = (node.get("href") or "").lower()
+        text = (node.get("text") or node.get("name") or "").strip().lower()
+        if href in {"", "#", "/"}:
+            return True
+        noise_patterns = (
+            "vod-show",
+            "vod-type",
+            "year-",
+            "area-",
+            "by-",
+            "class-",
+            "page-",
+            "search",
+            "label",
+            "topic",
+        )
+        if any(pattern in href for pattern in noise_patterns):
+            return True
+        if text in {"首页", "上一页", "下一页", "尾页", "全部", "home", "next", "previous"}:
+            return True
+        if re.fullmatch(r"\d+", text):
+            return True
+        return False
 
     def _group_by_xpath_row(self, nodes: list[dict]) -> dict[str, list[dict]]:
         groups: dict[str, list[dict]] = {}
@@ -242,8 +311,8 @@ class ExtractProjector:
 
         for node in sorted_nodes:
             href = node.get("href", "")
-            if href.startswith("http://") or href.startswith("https://"):
-                item[url_field] = href
+            if href:
+                item[url_field] = self._normalize_url(href, node.get("url", ""))
                 break
 
         title_candidates = []
@@ -277,6 +346,11 @@ class ExtractProjector:
             item[title_field] = item[url_field]
 
         return item
+
+    def _normalize_url(self, href: str, base_url: str = "") -> str:
+        if href.startswith("http://") or href.startswith("https://"):
+            return href
+        return urljoin(base_url or "", href)
 
 
 class TokenBudgetEnforcer:

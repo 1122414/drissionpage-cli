@@ -52,6 +52,77 @@ function hasPointerEvents(node) {
   const style = window.getComputedStyle(node);
   return !style || style.pointerEvents !== 'none';
 }
+
+function classText(node) {
+  const raw = node.className || '';
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw.baseVal === 'string') return raw.baseVal;
+  return '';
+}
+
+function classTokens(node) {
+  return classText(node).toLowerCase().split(/[\s_-]+/).filter(Boolean);
+}
+
+function checkboxRelatedNodes(node) {
+  const nodes = [];
+  let current = node;
+  for (let i = 0; current && i < 5; i += 1) {
+    nodes.push(current);
+    current = current.parentElement;
+  }
+  const label = node.closest && node.closest('label');
+  if (label && !nodes.includes(label)) nodes.push(label);
+  return nodes;
+}
+
+function isCheckboxish(node) {
+  const tag = (node.tagName || '').toLowerCase();
+  const type = (node.getAttribute('type') || '').toLowerCase();
+  const role = (node.getAttribute('role') || '').toLowerCase();
+  const classes = classText(node).toLowerCase();
+  if (tag === 'input' && (type === 'checkbox' || type === 'radio')) return true;
+  if (role === 'checkbox' || role === 'radio' || role === 'switch') return true;
+  return classes.includes('checkbox') || classes.includes('check-box') || classes.includes('check_box');
+}
+
+function relatedCheckInput(node) {
+  const tag = (node.tagName || '').toLowerCase();
+  const type = (node.getAttribute('type') || '').toLowerCase();
+  if (tag === 'input' && (type === 'checkbox' || type === 'radio')) return node;
+
+  const selectors = 'input[type="checkbox"],input[type="radio"]';
+  if (node.querySelector) {
+    const child = node.querySelector(selectors);
+    if (child) return child;
+  }
+  const label = node.closest && node.closest('label');
+  if (label && label.querySelector) {
+    const labelled = label.querySelector(selectors);
+    if (labelled) return labelled;
+  }
+  return null;
+}
+
+function checkedState(node) {
+  const input = relatedCheckInput(node);
+  if (input === node && typeof input.checked === 'boolean') return !!input.checked;
+
+  for (const candidate of checkboxRelatedNodes(node)) {
+    const aria = candidate.getAttribute && candidate.getAttribute('aria-checked');
+    if (aria === 'true' || aria === 'mixed') return true;
+    if (aria === 'false') return false;
+  }
+
+  for (const candidate of checkboxRelatedNodes(node)) {
+    if (!isCheckboxish(candidate)) continue;
+    const tokens = classTokens(candidate);
+    if (tokens.some(token => ['unchecked', 'uncheck', 'disabled'].includes(token))) continue;
+    if (tokens.some(token => ['checked', 'selected', 'active', 'on'].includes(token))) return true;
+  }
+  if (input && typeof input.checked === 'boolean') return !!input.checked;
+  return false;
+}
 """
 
 SNAPSHOT_SCRIPT = SHARED_JS_HELPERS + """
@@ -117,6 +188,66 @@ function associatedLabel(node) {
   return '';
 }
 
+function nearbyOwnText(node) {
+  const parts = [];
+  let current = node.parentElement;
+  for (let i = 0; current && i < 2; i += 1) {
+    const text = compactText(current.innerText || current.textContent || '');
+    if (text) parts.push(text);
+    current = current.parentElement;
+  }
+  return parts.join(' ');
+}
+
+function inputFieldHint(node) {
+  const tag = (node.tagName || '').toLowerCase();
+  if (tag !== 'input' && tag !== 'textarea') return '';
+  const type = (node.getAttribute('type') || '').toLowerCase();
+  const raw = [
+    node.id || '',
+    classText(node),
+    node.getAttribute('name') || '',
+    node.getAttribute('placeholder') || '',
+    node.getAttribute('aria-label') || '',
+    node.getAttribute('autocomplete') || '',
+    node.getAttribute('inputmode') || '',
+    nearbyOwnText(node)
+  ].join(' ').toLowerCase();
+  if (type === 'password' || raw.includes('password') || raw.includes('pwd') || raw.includes('密码')) return '密码';
+  if (raw.includes('验证码') || raw.includes('captcha') || raw.includes('verify') || raw.includes('verification') || raw.includes('获取验证码')) return '验证码';
+  if (type === 'tel' || raw.includes('phone') || raw.includes('mobile') || raw.includes('tel') || raw.includes('手机号') || raw.includes('手机')) return '手机号';
+  const maxLength = Number(node.getAttribute('maxlength') || node.maxLength || 0);
+  if (maxLength === 11) return '手机号';
+  const form = node.closest('form');
+  if (form) {
+    const formText = compactText(form.innerText || form.textContent || '');
+    const inputs = Array.from(form.querySelectorAll('input,textarea')).filter(item => {
+      const itemType = (item.getAttribute('type') || '').toLowerCase();
+      return itemType !== 'hidden' && isVisible(item);
+    });
+    const index = inputs.indexOf(node);
+    if (formText.includes('注册') && formText.includes('获取验证码') && inputs.length >= 4) {
+      if (index === 0) return '昵称';
+      if (index === 1) return '手机号';
+      if (index === 2) return '验证码';
+      if (index === 3) return '密码';
+    }
+  }
+  if (raw.includes('nickname') || raw.includes('nick') || raw.includes('user') || raw.includes('name') || raw.includes('昵称') || raw.includes('用户名')) return '昵称';
+  return '';
+}
+
+function agreementText(node) {
+  const parentText = compactText((node.parentElement && (node.parentElement.innerText || node.parentElement.textContent)) || '');
+  const grandText = compactText((node.parentElement && node.parentElement.parentElement && (node.parentElement.parentElement.innerText || node.parentElement.parentElement.textContent)) || '');
+  for (const text of [parentText, grandText]) {
+    if ((text.includes('同意') || text.includes('阅读') || text.includes('接受')) && (text.includes('协议') || text.includes('隐私') || text.includes('条款'))) {
+      return text;
+    }
+  }
+  return '';
+}
+
 function explicitRole(node) {
   return (node.getAttribute('role') || '').trim().toLowerCase();
 }
@@ -124,12 +255,26 @@ function explicitRole(node) {
 function implicitRole(node) {
   const tag = (node.tagName || '').toLowerCase();
   const type = (node.getAttribute('type') || '').toLowerCase();
+  const className = classText(node).toLowerCase();
+  const classes = classTokens(node);
+  if (className.includes('checkbox') || className.includes('check-box') || className.includes('check_box')) return 'checkbox';
+  if (
+    classes.includes('tabitem') ||
+    (classes.includes('tab') && classes.includes('item')) ||
+    className.includes('ant-tabs-tab')
+  ) return 'tab';
+  if (
+    (classes.includes('tabs') && (classes.includes('nav') || classes.includes('bar') || classes.includes('wrap'))) ||
+    className.includes('ant-tabs-nav')
+  ) return 'tablist';
   if (tag === 'a' && node.getAttribute('href')) return 'link';
   if (tag === 'button') return 'button';
   if (tag === 'summary') return 'button';
   if (tag === 'textarea') return 'textbox';
   if (tag === 'select') return 'combobox';
   if (tag === 'option') return 'option';
+  const text = visibleText(node);
+  if ((tag === 'span' || tag === 'div') && /^(获取验证码|发送验证码|重新发送|换一换|提交|确认)$/.test(text)) return 'button';
   if (tag === 'nav') return 'navigation';
   if (tag === 'main') return 'main';
   if (tag === 'aside') return 'complementary';
@@ -143,6 +288,7 @@ function implicitRole(node) {
   if (tag === 'thead' || tag === 'tbody' || tag === 'tfoot') return 'rowgroup';
   if (tag === 'tr') return 'row';
   if (tag === 'section') return 'region';
+  if (node.getAttribute('aria-selected') !== null && node.closest('[role="tablist"],[class*="tabs"]')) return 'tab';
   if (tag === 'input') {
     if (type === 'checkbox') return 'checkbox';
     if (type === 'radio') return 'radio';
@@ -163,7 +309,7 @@ function visibleText(node) {
 function iconHint(node) {
   const raw = [
     node.id || '',
-    node.className || '',
+    classText(node),
     node.getAttribute('name') || '',
     node.getAttribute('title') || '',
     node.getAttribute('aria-label') || ''
@@ -195,13 +341,30 @@ function accessibleName(node) {
   const tag = (node.tagName || '').toLowerCase();
   const inputType = (node.getAttribute('type') || '').toLowerCase();
   const candidates = [
+    inputFieldHint(node),
+    role === 'checkbox' ? agreementText(node) : '',
     node.getAttribute('aria-label'),
     textByIds(node.getAttribute('aria-labelledby')),
     associatedLabel(node),
     node.getAttribute('title'),
     node.getAttribute('alt')
   ];
-  if (role === 'button' || role === 'link' || role === 'checkbox' || role === 'radio' || tag === 'button' || tag === 'a') {
+  if (role === 'button' || role === 'link' || role === 'tab' || role === 'checkbox' || role === 'radio' || tag === 'button' || tag === 'a') {
+    candidates.push(visibleText(node));
+  }
+  // For elements that appear interactive via cursor, tabindex, or class patterns, also use visible text
+  const classes = classTokens(node);
+  const hasClickableStyle = (() => {
+    try {
+      const style = window.getComputedStyle ? window.getComputedStyle(node) : null;
+      if (style && style.cursor === 'pointer') return true;
+    } catch (e) {}
+    const tabindex = node.getAttribute('tabindex');
+    if (tabindex !== null && tabindex !== '-1') return true;
+    if (classes.some(c => /^(icon|btn|button|search|submit|close|menu|toggle|tab|tabitem)$/.test(c))) return true;
+    return false;
+  })();
+  if (hasClickableStyle) {
     candidates.push(visibleText(node));
   }
   candidates.push(node.getAttribute('placeholder'));
@@ -268,18 +431,16 @@ function isInteractiveNode(node) {
   if (node.matches && node.matches('a,button,input,textarea,select,summary,[onclick],[contenteditable="true"]')) return true;
   if (['button', 'link', 'textbox', 'checkbox', 'radio', 'tab', 'switch', 'combobox', 'option'].includes(role)) return true;
   // Icon/button spans and i tags with common class patterns
-  let className = '';
-  try { className = (node.className || '').toLowerCase(); } catch (e) {}
-  if (className && /\b(icon|btn|button|search|submit|close|menu|toggle)\b/.test(className)) return true;
-  // Elements with pointer cursor that have click handlers or are inside clickable parents
+  const classes = classTokens(node);
+  if (classes.some(c => /^(icon|btn|button|search|submit|close|menu|toggle|tab|tabitem)$/.test(c))) return true;
+  // Elements with pointer cursor are likely interactive (common for tab switches, custom buttons)
   try {
     const style = window.getComputedStyle ? window.getComputedStyle(node) : null;
-    if (style && style.cursor === 'pointer') {
-      if (node.closest && node.closest('a,button,[onclick]')) return true;
-      const parent = node.parentElement;
-      if (parent && parent.matches && (parent.matches('a,button') || parent.getAttribute('onclick'))) return true;
-    }
+    if (style && style.cursor === 'pointer') return true;
   } catch (e) {}
+  // Elements with explicit positive tabindex are likely interactive
+  const tabindex = node.getAttribute('tabindex');
+  if (tabindex !== null && tabindex !== '-1') return true;
   return false;
 }
 
@@ -370,7 +531,7 @@ function pushNode(node) {
     context: contextInfo(node),
     semantic_level: semanticLevel,
     disabled: !isEnabled(node),
-    checked: !!node.checked || node.getAttribute('aria-checked') === 'true',
+    checked: checkedState(node),
     selected: !!node.selected || node.getAttribute('aria-selected') === 'true',
     expanded: node.getAttribute('aria-expanded') === 'true'
   });
@@ -392,11 +553,86 @@ return nodes;
 ELEMENT_STATE_SCRIPT = SHARED_JS_HELPERS + """
 return {
   text: compactText(this.innerText || this.textContent || ''),
+  value: this.value || '',
   bounds: elementBounds(this),
   visible: isVisible(this),
   in_viewport: isInViewport(this),
   enabled: isEnabled(this),
-  interactable_now: isVisible(this) && isInViewport(this) && isEnabled(this) && hasPointerEvents(this)
+  interactable_now: isVisible(this) && isInViewport(this) && isEnabled(this) && hasPointerEvents(this),
+  checked: checkedState(this),
+  selected: !!this.selected || this.getAttribute('aria-selected') === 'true',
+  expanded: this.getAttribute('aria-expanded') === 'true'
+};
+"""
+
+PREFERRED_CLICK_OFFSET_SCRIPT = SHARED_JS_HELPERS + """
+function localClassText(node) {
+  const raw = node.className || '';
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw.baseVal === 'string') return raw.baseVal;
+  return '';
+}
+
+function localButtonish(node) {
+  const tag = (node.tagName || '').toLowerCase();
+  const role = (node.getAttribute('role') || '').toLowerCase();
+  const type = (node.getAttribute('type') || '').toLowerCase();
+  const classes = localClassText(node).toLowerCase();
+  const text = compactText(node.innerText || node.textContent || '');
+  if (['button', 'a', 'summary'].includes(tag)) return true;
+  if (tag === 'input' && ['button', 'submit', 'reset', 'checkbox', 'radio'].includes(type)) return true;
+  if (['button', 'link', 'checkbox', 'radio', 'tab', 'switch'].includes(role)) return true;
+  if (classes.includes('checkbox') || classes.includes('check-box') || classes.includes('check_box')) return true;
+  if ((tag === 'span' || tag === 'div') && /^(获取验证码|发送验证码|重新发送|换一换|提交|确认|注册)$/.test(text)) return true;
+  return false;
+}
+
+function localBounds(node) {
+  const rect = node.getBoundingClientRect();
+  return {left: rect.left, top: rect.top, width: rect.width, height: rect.height};
+}
+
+const root = this;
+const rootRect = localBounds(root);
+const rootText = compactText(root.innerText || root.textContent || '');
+const rootArea = Math.max(rootRect.width * rootRect.height, 1);
+let best = null;
+let bestScore = -Infinity;
+
+for (const node of Array.from(root.querySelectorAll('*'))) {
+  if (!isVisible(node) || !isEnabled(node) || !hasPointerEvents(node)) continue;
+  if (!localButtonish(node)) continue;
+  const rect = localBounds(node);
+  if (rect.width <= 0 || rect.height <= 0) continue;
+  const text = compactText(node.innerText || node.textContent || '');
+  const tag = (node.tagName || '').toLowerCase();
+  const role = (node.getAttribute('role') || '').toLowerCase();
+  const area = Math.max(rect.width * rect.height, 1);
+  const sameText = text && (rootText === text || rootText.includes(text));
+  const muchSmaller = area < rootArea * 0.75;
+  if (!sameText && !muchSmaller && tag !== 'button' && tag !== 'a' && role !== 'button') continue;
+  let score = 0;
+  if (sameText) score += 100;
+  if (muchSmaller) score += 60;
+  if (tag === 'button' || tag === 'a') score += 50;
+  if (tag === 'span') score += 40;
+  if (role === 'button' || role === 'checkbox') score += 40;
+  if (/获取验证码|发送验证码|重新发送/.test(text)) score += 120;
+  if (/checkbox|check-box|check_box/.test(localClassText(node).toLowerCase())) score += 80;
+  score -= area / rootArea;
+  if (score > bestScore) {
+    best = node;
+    bestScore = score;
+  }
+}
+
+if (!best) return null;
+const bestRect = localBounds(best);
+return {
+  offset_x: Number((bestRect.left - rootRect.left + bestRect.width / 2).toFixed(1)),
+  offset_y: Number((bestRect.top - rootRect.top + bestRect.height / 2).toFixed(1)),
+  target_text: compactText(best.innerText || best.textContent || ''),
+  target_tag: (best.tagName || '').toLowerCase()
 };
 """
 
@@ -414,7 +650,14 @@ class DrissionPageAdapter:
         return self.page_info(tab)
 
     def snapshot_nodes(self, tab, root_xpath: str | None = None, depth: int | None = None) -> list[SnapshotNodeRecord]:
-        root = tab.ele(f"xpath:{root_xpath}") if root_xpath else tab.ele(BODY_LOCATOR)
+        if root_xpath:
+            root = tab.ele(f"xpath:{root_xpath}")
+        else:
+            try:
+                root = tab.ele(BODY_LOCATOR)
+            except Exception:
+                tab.wait.ele_displayed(BODY_LOCATOR, timeout=10)
+                root = tab.ele(BODY_LOCATOR)
         max_depth = depth if depth is not None else -1
         payload = root.run_js(SNAPSHOT_SCRIPT, max_depth)
         return self._serialize_snapshot_payloads(payload)
@@ -432,6 +675,17 @@ class DrissionPageAdapter:
         element.run_js("this.scrollIntoView({block: 'center', inline: 'center'});")
 
     def click(self, element) -> None:
+        offset = None
+        try:
+            offset = element.run_js(PREFERRED_CLICK_OFFSET_SCRIPT)
+        except Exception:
+            offset = None
+        if isinstance(offset, dict) and offset.get("offset_x") is not None and offset.get("offset_y") is not None:
+            try:
+                element.click.at(offset_x=offset["offset_x"], offset_y=offset["offset_y"])
+                return
+            except Exception:
+                pass
         element.click()
 
     def type_text(self, element, text: str) -> None:

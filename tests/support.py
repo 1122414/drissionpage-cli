@@ -205,9 +205,13 @@ def run_public_smoke_workflow(session: str, url: str = "https://example.com") ->
         "clicked": clicked,
     }
 
+def _normalize_for_match(text: str) -> str:
+    t = re.sub(r"\s+", "", text.strip().lower())
+    return re.sub(r"(?<!\d)0+(\d)", r"\1", t)
+
+
 def best_text_match(nodes: list[dict], text: str) -> dict:
-    target = text.strip().lower()
-    normalized_target = re.sub(r"\s+", "", target)
+    normalized_target = _normalize_for_match(text)
     ranked: list[tuple[int, dict]] = []
     for node in nodes:
         fields = [
@@ -219,8 +223,8 @@ def best_text_match(nodes: list[dict], text: str) -> dict:
             node.get("aria_label") or "",
             node.get("context", {}).get("heading") or "",
         ]
-        haystack = " ".join(fields).strip().lower()
-        if not haystack or target not in haystack:
+        haystack = _normalize_for_match(" ".join(fields))
+        if not haystack or normalized_target not in haystack:
             continue
         score = score_text_match(
             node,

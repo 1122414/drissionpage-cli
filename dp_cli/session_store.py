@@ -31,7 +31,10 @@ KNOWN_BROWSER_PATHS = (
 def read_json(path: Path, default: dict) -> dict:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        return default
+    return json.loads(text)
 
 
 def write_json(path: Path, payload: dict) -> None:

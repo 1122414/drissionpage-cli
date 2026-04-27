@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from dp_cli.projector import ExtractProjector
 from dp_cli.session import SessionManager
+from dp_cli.service import CliService
 from tests.support import (
     HOT_DONE_TEXT,
     MOVIES_LINK_ID,
@@ -279,6 +281,315 @@ def test_snapshot_index_keeps_navigation_and_pagination_visible_to_agent(local_f
         cleanup_session(local_session)
 
 
+def test_snapshot_index_prioritizes_dialog_controls_for_agent_summary():
+    def node(
+        ref: str,
+        *,
+        ref_type: str = "element",
+        tag: str = "button",
+        role: str = "button",
+        name: str = "",
+        text: str = "",
+        parent_ref: str | None = None,
+        interactable: bool = True,
+    ) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": ref_type,
+            "tag": tag,
+            "role": role,
+            "name": name,
+            "text": text,
+            "parent_ref": parent_ref,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": interactable,
+            },
+            "states": {
+                "disabled": False,
+                "checked": False,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    background = [node(f"e{i}", tag="a", role="link", name=f"image {i}") for i in range(1, 40)]
+    dialog = node(
+        "r1",
+        ref_type="container",
+        tag="div",
+        role="dialog",
+        name="dialog",
+        text="Login Register",
+        interactable=False,
+    )
+    tablist = node("e40", tag="div", role="tablist", name="Login Register", text="Login Register", parent_ref="r1")
+    login = node("e41", tag="span", role="tab", name="Login", text="Login", parent_ref="e40")
+    register = node("e42", tag="span", role="tab", name="Register", text="Register", parent_ref="e40")
+
+    index = CliService()._build_index([*background, dialog, tablist, login, register])
+
+    top_interactable = index["interactable_elements"][:5]
+    assert any(item["ref"] == "e42" and item["role"] == "tab" for item in top_interactable)
+    assert any(item["ref"] == "e41" and item["role"] == "tab" for item in top_interactable)
+    assert any(item["ref"] == "e42" for item in index["surface_index"][:10])
+
+
+def test_snapshot_index_keeps_form_field_and_checkbox_metadata_visible():
+    def node(
+        ref: str,
+        *,
+        role: str,
+        tag: str = "input",
+        name: str = "",
+        text: str = "",
+        input_type: str = "",
+        value: str = "",
+        checked: bool = False,
+        parent_ref: str | None = "r1",
+    ) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "element",
+            "tag": tag,
+            "role": role,
+            "name": name,
+            "text": text,
+            "value": value,
+            "placeholder": "",
+            "label": "",
+            "input_type": input_type,
+            "parent_ref": parent_ref,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": True,
+            },
+            "states": {
+                "disabled": False,
+                "checked": checked,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    dialog = {
+        "ref": "r1",
+        "ref_type": "container",
+        "tag": "div",
+        "role": "dialog",
+        "name": "dialog",
+        "text": "",
+        "parent_ref": None,
+        "visibility": {
+            "visible": True,
+            "in_viewport": True,
+            "interactable_now": False,
+        },
+        "states": {
+            "disabled": False,
+            "checked": False,
+            "selected": False,
+            "expanded": False,
+        },
+        "semantic_level": "surface",
+    }
+    index = CliService()._build_index(
+        [
+            dialog,
+            node("e1", role="textbox", name="Nickname", input_type="text", value="yyyyb"),
+            node("e2", role="textbox", name="Phone", input_type="text"),
+            node("e3", role="textbox", name="Code", input_type="text"),
+            node("e4", role="textbox", name="Password", input_type="password"),
+            node("e5", role="button", tag="button", name="Register", text="Register"),
+            node("e6", role="checkbox", tag="span", name="I agree to terms", checked=False),
+            node("e7", role="button", tag="span", name="Get code", text="Get code"),
+        ]
+    )
+
+    interactable = index["interactable_elements"]
+    checkbox = next(item for item in interactable if item["ref"] == "e6")
+    password = next(item for item in interactable if item["ref"] == "e4")
+    nickname = next(item for item in interactable if item["ref"] == "e1")
+    assert interactable.index(checkbox) < interactable.index(next(item for item in interactable if item["ref"] == "e5"))
+    assert checkbox["role"] == "checkbox"
+    assert checkbox["checked"] is False
+    assert password["input_type"] == "password"
+    assert nickname["value"] == "yyyyb"
+
+
+def test_custom_checkbox_click_returns_post_checked_state(local_fixture_server, local_session):
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        before = run_cli("snapshot", "--session", local_session, "--headless")
+        checkbox = next(
+            item
+            for item in before["data"]["index"]["interactable_elements"]
+            if item.get("role") == "checkbox" and "I agree" in item.get("name", "")
+        )
+        assert checkbox["checked"] is False
+
+        clicked = run_cli("click", "--session", local_session, "--headless", "--ref", checkbox["ref"])
+        assert clicked["ok"] is True
+        assert clicked["data"]["target_state"]["checked"] is True
+
+        after = run_cli("snapshot", "--session", local_session, "--headless")
+        checked = next(
+            item
+            for item in after["data"]["index"]["interactable_elements"]
+            if item.get("ref") == checkbox["ref"]
+        )
+        assert checked["checked"] is True
+    finally:
+        cleanup_session(local_session)
+
+
+def test_snapshot_index_promotes_extractable_data_regions():
+    def container(ref: str, xpath: str, depth: int, text: str = "") -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "container",
+            "tag": "div",
+            "role": "",
+            "name": "Movie list",
+            "text": text,
+            "xpath": xpath,
+            "depth": depth,
+            "visibility": {"visible": True, "in_viewport": True, "interactable_now": False},
+            "states": {"disabled": False, "checked": False, "selected": False, "expanded": False},
+            "semantic_level": "surface",
+        }
+
+    def movie_link(index: int) -> dict:
+        return {
+            "ref": f"e{index}",
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": f"Movie {index}",
+            "text": f"Movie {index}",
+            "href": f"/vod-detail-id-{index}.html",
+            "url": "https://example.test/vod-show-id-3.html",
+            "xpath": f"/html/body/div/main/div/a[{index}]",
+            "visibility": {"visible": True, "in_viewport": True, "interactable_now": True},
+            "states": {"disabled": False, "checked": False, "selected": False, "expanded": False},
+            "semantic_level": "surface",
+        }
+
+    nodes = [
+        container("r1", "/html/body/div", 1, "Home Filter Movie 1 Movie 2 Movie 3"),
+        container("r2", "/html/body/div/main/div", 3, "Movie 1 Movie 2 Movie 3"),
+        *[movie_link(i) for i in range(1, 5)],
+    ]
+
+    index = CliService()._build_index(nodes)
+
+    assert index["data_regions"][0]["ref"] == "r2"
+    assert index["data_regions"][0]["item_count"] == 4
+    assert index["surface_index"][0]["ref"] == "r2"
+    assert index["surface_index"][0]["item_count"] == 4
+
+
+def test_extract_projector_outputs_relative_detail_links_with_schema():
+    nodes = [
+        {
+            "ref": f"e{i}",
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": f"Movie {i}",
+            "text": f"Movie {i}",
+            "href": f"/vod-detail-id-{i}.html",
+            "url": "https://example.test/vod-show-id-3.html",
+        }
+        for i in range(1, 4)
+    ]
+
+    result = ExtractProjector().project(
+        {"representative_ref": "r1", "item_refs": [node["ref"] for node in nodes]},
+        nodes,
+        ["title", "url"],
+    )
+
+    assert result["item_count"] == 3
+    assert result["items"][0] == {
+        "url": "https://example.test/vod-detail-id-1.html",
+        "title": "Movie 1",
+    }
+
+
+def test_snapshot_index_prefers_leaf_text_button_over_wide_parent():
+    def node(
+        ref: str,
+        *,
+        tag: str,
+        role: str,
+        name: str,
+        text: str,
+        parent_ref: str | None = "r1",
+    ) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "element",
+            "tag": tag,
+            "role": role,
+            "name": name,
+            "text": text,
+            "value": "",
+            "placeholder": "",
+            "label": "",
+            "input_type": "",
+            "parent_ref": parent_ref,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": True,
+            },
+            "states": {
+                "disabled": False,
+                "checked": False,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    dialog = {
+        "ref": "r1",
+        "ref_type": "container",
+        "tag": "div",
+        "role": "dialog",
+        "name": "dialog",
+        "text": "",
+        "parent_ref": None,
+        "visibility": {
+            "visible": True,
+            "in_viewport": True,
+            "interactable_now": False,
+        },
+        "states": {
+            "disabled": False,
+            "checked": False,
+            "selected": False,
+            "expanded": False,
+        },
+        "semantic_level": "surface",
+    }
+    index = CliService()._build_index(
+        [
+            dialog,
+            node("e1", tag="div", role="button", name="Get code", text="Get code"),
+            node("e2", tag="div", role="button", name="Get code", text="Get code", parent_ref="e1"),
+            node("e3", tag="span", role="button", name="Get code", text="Get code", parent_ref="e2"),
+        ]
+    )
+
+    assert index["interactable_elements"][0]["ref"] == "e3"
+
+
 def test_find_locator_finds_icon_search_element(local_fixture_server, local_session):
     try:
         run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
@@ -315,6 +626,45 @@ def test_find_and_click_can_operate_on_offscreen_pagination(local_fixture_server
         planner_nodes = snapshot_nodes(planner_snapshot)
         next_page_after = select_node(planner_nodes, ref_type="element", role="button", name_contains="Next")
         assert next_page_after.get("in_viewport") is True
+    finally:
+        cleanup_session(local_session)
+
+
+def test_find_text_matches_leading_zero_episode(local_fixture_server, local_session):
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+
+        found = run_cli("find", "--session", local_session, "--headless", "--text", "第5集")
+        assert found["ok"] is True
+        assert found["data"]["count"] >= 1
+        episode_nodes = [
+            node for node in found["data"]["nodes"]
+            if "第05集" in (node.get("text") or "") or "第05集" in (node.get("name") or "")
+        ]
+        assert len(episode_nodes) >= 1
+        episode = episode_nodes[0]
+        assert episode["ref_type"] == "element"
+    finally:
+        cleanup_session(local_session)
+
+
+def test_find_text_recognizes_tab_item_span_as_element(local_fixture_server, local_session):
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+
+        found = run_cli("find", "--session", local_session, "--headless", "--text", "注册")
+        assert found["ok"] is True
+        assert found["data"]["count"] >= 1
+
+        # Find the exact "注册" span node (not the parent container)
+        register_nodes = [
+            node for node in found["data"]["nodes"]
+            if node.get("name") == "注册" and node.get("tag") == "span"
+        ]
+        assert len(register_nodes) >= 1, "Expected span with name='注册' to be found"
+        register = register_nodes[0]
+        assert register["ref_type"] == "element"
+        assert register.get("exact_match") is True
     finally:
         cleanup_session(local_session)
 

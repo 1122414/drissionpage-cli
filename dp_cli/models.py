@@ -24,16 +24,23 @@ def score_text_match(
     viewport_bias: int = 0,
     interactable_bias: int = 0,
     actionable_bias: int = 0,
+    native_tag_bias: int = 0,
 ) -> int:
     """Score how well a node matches a text query.
 
     Callers should pass bias flags appropriate to their context.
     Default weights match the service-side scoring in CliService._filter_text_matches.
     """
+    def _norm(text: str) -> str:
+        t = re.sub(r"\s+", "", (text or "").strip().lower())
+        t = re.sub(r"(?<!\d)0+(\d)", r"\1", t)
+        return t
+
     score = 0
-    exact_name = re.sub(r"\s+", "", (node.get("name") or "").strip().lower())
-    exact_text = re.sub(r"\s+", "", (node.get("text") or "").strip().lower())
-    label_text = re.sub(r"\s+", "", (node.get("label") or "").strip().lower())
+    query = _norm(query)
+    exact_name = _norm(node.get("name"))
+    exact_text = _norm(node.get("text"))
+    label_text = _norm(node.get("label"))
     if exact_name == query:
         score += exact_name_weight
     if exact_text == query:
@@ -54,6 +61,8 @@ def score_text_match(
         score += interactable_bias
     if actionable_bias and node.get("role") in {"button", "link"}:
         score += actionable_bias
+    if native_tag_bias and node.get("tag") in {"button", "a", "input"}:
+        score += native_tag_bias
     return score
 
 

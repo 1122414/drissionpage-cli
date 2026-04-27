@@ -18,6 +18,18 @@ except ImportError:
     pass
 
 
+MAX_STEPS = 50
+LLM_TIMEOUT = 60
+SUBPROCESS_TIMEOUT = 60
+LLM_TEMPERATURE = 0
+COMPACT_HISTORY_LIMIT = 10
+LAST_RESULTS_LIMIT = 10
+RECENT_ACTIONS_LIMIT = 10
+DEFAULT_EXPAND_DEPTH = 10
+DEFAULT_SAMPLE_SIZE = 10
+
+ENABLE_DUPLICATE_ACTION_BLOCKING = False
+
 DEFAULT_CONFIG = {
     "api_key": os.getenv("OPENAI_API_KEY", ""),
     "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
@@ -32,8 +44,16 @@ SCENARIOS = {
     # 或使用 --dry-run 快速查看页面 index 结构而不调用 LLM
     # "automation": "打开 https://www.baidu.com，在搜索框输入'python tutorial'，点击搜索按钮",
     # "crawler_list": "访问 https://news.ycombinator.com，提取前5条新闻的标题和链接",
-    # "hybrid": "去 https://www.libvio.mov/ 搜索进击的巨人，并播放第一季的第五集",
-    "hybrid": "去 https://www.mtyy1.com/ 搜索进击的巨人，并播放第一季的第五集",
+    # "hybrid": "去 https://www.libvio.life/ 搜索进击的巨人，并播放第一季的第五集",
+    # "hybrid": "去 https://www.mtyy1.com/ 搜索进击的巨人，并播放第一季的第五集",
+
+    # 注册已经成功，register_13
+    # "register": "去 https://miankoutupian.com/image/free_copy_right 注册一个账号，昵称：yyyyb，手机号：17827062314；密码：Aa123456"
+
+    # 成功，scrawl_5.json
+    # "scrawl": "去这个网站，https://www.wangfei.la/，进入左侧电影栏目，爬取前两页的电影信息，并存储为json文件",
+    "scrawl_info": "去这个网站，https://www.wangfei.la/，进入左侧电影栏目，爬取前两页的电影信息，注意要点进每一部电影去获取其详情信息，并存储为json文件"
+    
 }
 
 
@@ -72,8 +92,8 @@ class LLMClient:
             api_key=api_key,
             base_url=base_url or None,
             model=model,
-            temperature=0,
-            timeout=60,
+            temperature=LLM_TEMPERATURE,
+            timeout=LLM_TIMEOUT,
         )
         self.model = model
 
@@ -132,7 +152,7 @@ class DPCLIExecutor:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=SUBPROCESS_TIMEOUT,
                 encoding="utf-8",
                 errors="replace",
             )
@@ -154,7 +174,7 @@ class DPCLIExecutor:
                 return {"ok": False, "error": f"Expected JSON object, got {type(parsed).__name__}", "raw": result.stdout}
             return parsed
         except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "Timeout after 30s"}
+            return {"ok": False, "error": f"Timeout after {SUBPROCESS_TIMEOUT}s"}
         except json.JSONDecodeError:
             return {"ok": False, "error": "Invalid JSON output", "raw": result.stdout if result else None}
         except Exception as e:
@@ -221,6 +241,10 @@ class DPCLIAgent:
         self.history: list[dict[str, Any]] = []
         self.total_tokens = 0
         self.collected_items: list[dict] = []
+        self.extracted_pages = 0
+        self.extracted_keys: set[str] = set()
+        self.last_extracted_page_url: str | None = None
+        self.target_pages = 1
         self.recent_actions: list[dict[str, Any]] = []
         self.last_results: list[dict[str, Any]] = []
 
@@ -239,9 +263,23 @@ class DPCLIAgent:
             ]
         elif skill == "click":
             record["target"] = data.get("target", {})
+            target_state = data.get("target_state")
+            if isinstance(target_state, dict):
+                record["target_state"] = {
+                    key: target_state.get(key)
+                    for key in ("checked", "selected", "expanded", "value", "visible", "in_viewport", "interactable_now")
+                    if key in target_state
+                }
         elif skill == "type":
             record["typed_text"] = data.get("typed_text", "")
             record["target"] = data.get("target", {})
+            target_state = data.get("target_state")
+            if isinstance(target_state, dict):
+                record["target_state"] = {
+                    key: target_state.get(key)
+                    for key in ("checked", "selected", "expanded", "value", "visible", "in_viewport", "interactable_now")
+                    if key in target_state
+                }
         elif skill == "extract":
             items = data.get("items", [])
             record["item_count"] = len(items)
@@ -253,7 +291,7 @@ class DPCLIAgent:
             record["title"] = (data.get("page") or {}).get("title")
         if len(record) > 1:
             self.last_results.append(record)
-            if len(self.last_results) > 5:
+            if len(self.last_results) > LAST_RESULTS_LIMIT:
                 self.last_results.pop(0)
 
     def _record_action(self, skill: str, params: dict[str, Any], result: dict[str, Any]) -> None:
@@ -263,7 +301,7 @@ class DPCLIAgent:
             "params": self._safe_params(skill, params),
             "ok": ok,
         })
-        if len(self.recent_actions) > 3:
+        if len(self.recent_actions) > RECENT_ACTIONS_LIMIT:
             self.recent_actions.pop(0)
 
     def _is_duplicate_action(self, skill: str, params: dict[str, Any]) -> bool:
@@ -285,6 +323,8 @@ class DPCLIAgent:
         safe: dict[str, Any] = {}
         if skill in ("type", "click", "expand", "extract", "list-items") and "ref" in params:
             safe["ref"] = params["ref"]
+        if skill == "extract" and "target_ref" in params:
+            safe["target_ref"] = params["target_ref"]
         if skill in ("click", "find") and "locator" in params:
             safe["locator"] = params["locator"]
         if skill == "type" and "text" in params:
@@ -343,6 +383,21 @@ class DPCLIAgent:
             "   - EXCEPTIONS (these ARE allowed to repeat): snapshot, open — you may snapshot multiple times.\n"
             "   - After type, your next step MUST be click (submit/search) or snapshot — NEVER type again.\n"
             "   - If an action fails (ok=false), do NOT blindly retry the same action. Try a different approach (e.g., use find instead of ref).\n\n"
+            "CRAWLER / EXTRACTION RULES:\n"
+            "- current_state may contain data_regions. These are the preferred containers for list extraction.\n"
+            "- If data_regions is present, use extract with data_regions[0].ref and schema [\"title\", \"url\"] before expanding/clicking unrelated navigation containers.\n"
+            "- Do not extract from sidebar, category, filter, ranking, or navigation containers when a data_region exists.\n"
+            "- For goals asking for multiple pages, extract the current list page, navigate to the next page, then extract again. Do not stop after the first successful extract unless extraction_progress.pages_extracted has reached extraction_progress.target_pages.\n"
+            "- If you need the next page control and it is not visible, use find with text \"next\" or the site's next-page label, then click the returned link/button.\n\n"
+            "REGISTRATION FORM RULES:\n"
+            "- The main loop already gives you a fresh page-level snapshot before every decision. Do NOT choose page-level snapshot just to confirm a prior click/type; use current_state and last_results instead.\n"
+            "- Use field names, placeholder, label, input_type, and filled/checked state to map fields. Never type a password into a verification/captcha/code field.\n"
+            "- If last_results shows a successful checkbox click with target_state.checked=true, treat that checkbox as checked and move on.\n"
+            "- If an agreement/terms/privacy checkbox is visible and unchecked, click it before requesting a verification code or final submit.\n"
+            "- If a phone/SMS verification button such as '获取验证码', '发送验证码', or 'Get code' is visible, click it after the phone field is filled and the agreement checkbox has been handled.\n"
+            "- NEVER invent or guess a verification/SMS/captcha code. Do not type dummy codes such as 123456, 000000, 111111, or test codes unless the user explicitly provided that exact code in the goal.\n"
+            "- If the verification code is not provided and the get-code button has already been clicked, stop and report that external verification is required.\n"
+            "- Submit/register only after required text fields are filled, required checkbox is checked, and any visible verification-code step has been handled.\n\n"
             "STANDARD INTERACTION WORKFLOW (memorize this):\n"
             "Step A: snapshot → get index\n"
             "Step B: Check interactable_elements → click/type by ref if found\n"
@@ -403,7 +458,7 @@ class DPCLIAgent:
             if not ref:
                 return {"ok": False, "error": "expand requires 'ref' param (container ref like 'r1', 'r2')"}
             depth = params.get("depth")
-            return self.executor.expand(ref, depth if depth is not None else 2)
+            return self.executor.expand(ref, depth if depth is not None else DEFAULT_EXPAND_DEPTH)
         elif skill == "find":
             return self.executor.find(text=params.get("text"), locator=params.get("locator"))
         elif skill == "click":
@@ -421,7 +476,7 @@ class DPCLIAgent:
             if not group_ref:
                 return {"ok": False, "error": "list-items requires 'group_ref' param (container ref like 'r1', 'r2'). Use snapshot to find available group refs."}
             sample_size = params.get("sample_size")
-            return self.executor.list_items(group_ref, sample_size if sample_size is not None else 3)
+            return self.executor.list_items(group_ref, sample_size if sample_size is not None else DEFAULT_SAMPLE_SIZE)
         elif skill == "extract":
             target_ref = params.get("target_ref") or params.get("ref")
             if not target_ref:
@@ -444,7 +499,7 @@ class DPCLIAgent:
         else:
             return {"ok": False, "error": f"Unknown skill: {skill}"}
 
-    def _compact_history(self, limit: int = 2) -> list[dict[str, Any]]:
+    def _compact_history(self, limit: int = COMPACT_HISTORY_LIMIT) -> list[dict[str, Any]]:
         compact = []
         for item in self.history[-limit:]:
             result = item.get("result", {})
@@ -528,7 +583,7 @@ class DPCLIAgent:
         interactable = index.get("interactable_elements", [])
         if isinstance(interactable, list) and interactable:
             result["interactable_elements"] = [
-                {"ref": item.get("ref"), "role": item.get("role"), "name": item.get("name")}
+                self._compact_node_for_prompt(item)
                 for item in interactable[:15]
                 if isinstance(item, dict)
             ]
@@ -536,14 +591,16 @@ class DPCLIAgent:
         surface = index.get("surface_index", [])
         if isinstance(surface, list) and surface:
             result["surface_index"] = [
-                {
-                    "ref": item.get("ref"),
-                    "tag": item.get("tag"),
-                    "role": item.get("role"),
-                    "name": item.get("name"),
-                    "child_count": item.get("child_count"),
-                }
+                self._compact_node_for_prompt(item, include_child_count=True)
                 for item in surface[:20]
+                if isinstance(item, dict)
+            ]
+
+        data_regions = index.get("data_regions", [])
+        if isinstance(data_regions, list) and data_regions:
+            result["data_regions"] = [
+                self._compact_node_for_prompt(item, include_child_count=True)
+                for item in data_regions[:5]
                 if isinstance(item, dict)
             ]
 
@@ -564,11 +621,322 @@ class DPCLIAgent:
         if self.last_results:
             result["last_results"] = self.last_results[-5:]
 
+        if self.target_pages > 1 or self.extracted_pages or self.collected_items:
+            result["extraction_progress"] = {
+                "target_pages": self.target_pages,
+                "pages_extracted": self.extracted_pages,
+                "items_collected": len(self.collected_items),
+                "last_extracted_page_url": self.last_extracted_page_url,
+            }
+
         return result
 
-    def run(self, goal: str, max_steps: int = 20) -> AgentReport:
+    def _compact_node_for_prompt(self, item: dict[str, Any], include_child_count: bool = False) -> dict[str, Any]:
+        compact: dict[str, Any] = {
+            "ref": item.get("ref"),
+            "tag": item.get("tag"),
+            "role": item.get("role"),
+            "name": item.get("name"),
+        }
+        for key in ("text", "placeholder", "label", "input_type"):
+            value = item.get(key)
+            if value:
+                compact[key] = value
+        if "checked" in item:
+            compact["checked"] = item.get("checked")
+        if "selected" in item:
+            compact["selected"] = item.get("selected")
+        value = item.get("value")
+        if value:
+            compact["filled"] = True
+            if item.get("input_type") != "password":
+                compact["value"] = value
+        elif item.get("role") == "textbox":
+            compact["filled"] = False
+        if include_child_count:
+            compact["child_count"] = item.get("child_count")
+        item_count = item.get("item_count") or item.get("_data_region_item_count")
+        if item_count:
+            compact["item_count"] = item_count
+        sample_items = item.get("sample_items")
+        if isinstance(sample_items, list) and sample_items:
+            compact["sample_items"] = sample_items[:3]
+        return {k: v for k, v in compact.items() if v not in (None, "", [], {})}
+
+    def _is_verification_field(self, item: dict[str, Any] | None) -> bool:
+        if not item:
+            return False
+        haystack = " ".join(
+            str(item.get(key) or "")
+            for key in ("name", "text", "placeholder", "label", "aria_label")
+        ).lower()
+        return any(token in haystack for token in ("验证码", "verification", "captcha", "sms code", "code"))
+
+    def _is_verification_button(self, item: dict[str, Any]) -> bool:
+        if item.get("role") != "button":
+            return False
+        haystack = " ".join(str(item.get(key) or "") for key in ("name", "text", "label")).lower()
+        return any(token in haystack for token in ("获取验证码", "发送验证码", "重新发送", "get code", "send code", "verification"))
+
+    def _goal_provides_code(self, goal: str, code: str) -> bool:
+        if not code:
+            return False
+        return code in goal and any(token in goal for token in ("验证码", "短信", "code", "captcha", "verification"))
+
+    def _state_nodes(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = []
+        for section in ("data_regions", "interactable_elements", "surface_index"):
+            values = state.get(section)
+            if isinstance(values, list):
+                nodes.extend(item for item in values if isinstance(item, dict))
+        for result in state.get("last_results") or []:
+            if not isinstance(result, dict):
+                continue
+            values = result.get("nodes")
+            if isinstance(values, list):
+                nodes.extend(item for item in values if isinstance(item, dict))
+        return nodes
+
+    def _target_page_count(self, goal: str) -> int:
+        lower_goal = goal.lower()
+        if any(token in lower_goal for token in ("two pages", "first two pages", "2 pages")):
+            return 2
+        if any(token in goal for token in ("\u524d\u4e24\u9875", "\u4e24\u9875", "2\u9875")):
+            return 2
+        patterns = (
+            r"\u524d\s*(\d+)\s*\u9875",
+            r"(\d+)\s*\u9875",
+            r"first\s+(\d+)\s+pages?",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, lower_goal)
+            if match:
+                return max(1, int(match.group(1)))
+        return 1
+
+    def _goal_requests_extraction(self, goal: str) -> bool:
+        lower_goal = goal.lower()
+        if any(token in lower_goal for token in ("extract", "crawl", "scrape", "json", "items", "movies")):
+            return True
+        return any(
+            token in goal
+            for token in (
+                "\u63d0\u53d6",
+                "\u722c\u53d6",
+                "\u722c",
+                "\u5b58\u50a8",
+                "\u4fdd\u5b58",
+                "\u7535\u5f71",
+                "\u4fe1\u606f",
+            )
+        )
+
+    def _best_data_region_ref(self, state: dict[str, Any]) -> str | None:
+        regions = state.get("data_regions")
+        if not isinstance(regions, list):
+            return None
+        best_ref = None
+        best_count = -1
+        for item in regions:
+            if not isinstance(item, dict):
+                continue
+            ref = item.get("ref")
+            item_count = item.get("item_count") or item.get("_data_region_item_count") or 0
+            if ref and item_count > best_count:
+                best_ref = ref
+                best_count = int(item_count)
+        return best_ref
+
+    def _guard_extraction_action(
+        self,
+        state: dict[str, Any],
+        skill: str,
+        params: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], bool]:
+        if skill != "extract":
+            return skill, params, False
+        best_ref = self._best_data_region_ref(state)
+        if not best_ref:
+            return skill, params, False
+        requested_ref = params.get("target_ref") or params.get("ref")
+        if requested_ref == best_ref:
+            return skill, params, False
+        guarded_params = dict(params)
+        guarded_params.pop("ref", None)
+        guarded_params["target_ref"] = best_ref
+        guarded_params.setdefault("schema", ["title", "url"])
+        return skill, guarded_params, True
+
+    def _item_key(self, item: dict[str, Any]) -> str:
+        url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or item.get("name") or "").strip()
+        return url or title or json.dumps(item, ensure_ascii=False, sort_keys=True)
+
+    def _remember_extracted_items(self, data: dict[str, Any], page_url: str | None) -> int:
+        items = data.get("items", []) if isinstance(data, dict) else []
+        if not isinstance(items, list) or not items:
+            return 0
+        added = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = self._item_key(item)
+            if key in self.extracted_keys:
+                continue
+            self.extracted_keys.add(key)
+            self.collected_items.append(item)
+            added += 1
+        if page_url and page_url == self.last_extracted_page_url:
+            return added
+        self.extracted_pages += 1
+        self.last_extracted_page_url = page_url
+        return added
+
+    def _extracted_payload(self) -> dict[str, Any]:
+        return {
+            "item_count": len(self.collected_items),
+            "pages_extracted": self.extracted_pages,
+            "target_pages": self.target_pages,
+            "items": self.collected_items,
+        }
+
+    def _find_next_page_ref(self, state: dict[str, Any]) -> str | None:
+        tokens = (
+            "\u4e0b\u4e00\u9875",
+            "\u4e0b\u9875",
+            "next",
+            "next page",
+            ">",
+            "\u203a",
+            "\u00bb",
+        )
+        for item in self._state_nodes(state):
+            ref = item.get("ref")
+            if not ref:
+                continue
+            role = str(item.get("role") or "").lower()
+            tag = str(item.get("tag") or "").lower()
+            if role not in ("link", "button") and tag not in ("a", "button"):
+                continue
+            haystack = " ".join(
+                str(item.get(key) or "")
+                for key in ("name", "text", "label", "title", "aria_label")
+            ).lower()
+            if any(token in haystack for token in tokens):
+                return ref
+        return None
+
+    def _continuation_action_for_extraction(self, goal: str, state: dict[str, Any]) -> dict[str, Any] | None:
+        if not (self._goal_requests_extraction(goal) or self.collected_items or self.target_pages > 1):
+            return None
+        if self.extracted_pages >= self.target_pages:
+            return None
+        current_url = state.get("url")
+        if self.extracted_pages == 0 or current_url != self.last_extracted_page_url:
+            region_ref = self._best_data_region_ref(state)
+            if region_ref:
+                return {
+                    "skill": "extract",
+                    "params": {"target_ref": region_ref, "schema": ["title", "url"]},
+                    "reason": "Continue crawler goal by extracting the detected data region.",
+                }
+        next_ref = self._find_next_page_ref(state)
+        if next_ref:
+            return {
+                "skill": "click",
+                "params": {"ref": next_ref},
+                "reason": "Continue crawler goal by moving to the next page.",
+            }
+        return {
+            "skill": "find",
+            "params": {"text": "\u4e0b\u4e00\u9875"},
+            "reason": "Find the next-page control before extracting the next page.",
+        }
+
+    def _find_state_node(self, state: dict[str, Any], ref: str | None) -> dict[str, Any] | None:
+        if not ref:
+            return None
+        for item in self._state_nodes(state):
+            if item.get("ref") == ref:
+                return item
+        return None
+
+    def _find_verification_button_ref(self, state: dict[str, Any]) -> str | None:
+        recent_click_refs = {
+            action.get("params", {}).get("ref")
+            for action in self.recent_actions[-5:]
+            if action.get("skill") == "click"
+        }
+        fallback = None
+        for item in self._state_nodes(state):
+            if not self._is_verification_button(item):
+                continue
+            ref = item.get("ref")
+            if not fallback:
+                fallback = ref
+            if ref and ref not in recent_click_refs:
+                return ref
+        return fallback
+
+    def _find_unhandled_agreement_checkbox_ref(self, state: dict[str, Any]) -> str | None:
+        recent_click_refs = {
+            action.get("params", {}).get("ref")
+            for action in self.recent_actions[-5:]
+            if action.get("skill") == "click"
+        }
+        for item in self._state_nodes(state):
+            if item.get("role") != "checkbox":
+                continue
+            haystack = " ".join(str(item.get(key) or "") for key in ("name", "text", "label")).lower()
+            is_agreement = any(token in haystack for token in ("协议", "隐私", "条款", "同意", "接受", "agree", "terms", "privacy"))
+            if not is_agreement:
+                continue
+            ref = item.get("ref")
+            if item.get("checked") is False and ref not in recent_click_refs:
+                return ref
+        return None
+
+    def _guard_verification_action(
+        self,
+        goal: str,
+        state: dict[str, Any],
+        skill: str,
+        params: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+        target = self._find_state_node(state, params.get("ref"))
+        if skill == "click" and target and self._is_verification_button(target):
+            checkbox_ref = self._find_unhandled_agreement_checkbox_ref(state)
+            if checkbox_ref:
+                return "click", {"ref": checkbox_ref}, None
+            return skill, params, None
+        if skill != "type":
+            return skill, params, None
+        if not self._is_verification_field(target):
+            return skill, params, None
+        text = str(params.get("text") or "")
+        if self._goal_provides_code(goal, text):
+            return skill, params, None
+        button_ref = self._find_verification_button_ref(state)
+        if button_ref:
+            return "click", {"ref": button_ref}, None
+        return skill, params, {
+            "ok": False,
+            "error": {
+                "code": "verification_code_required",
+                "message": "Verification code is required and was not provided; refusing to guess or type a dummy code.",
+                "details": {"target_ref": params.get("ref")},
+            },
+        }
+
+    def run(
+        self,
+        goal: str,
+        max_steps: int = MAX_STEPS,
+        on_step: Any = None,
+    ) -> AgentReport:
         report = AgentReport(scenario="", goal=goal)
         start_time = time.time()
+        self.target_pages = self._target_page_count(goal)
 
         try:
             # Step 0: Plan
@@ -636,18 +1004,38 @@ class DPCLIAgent:
                 skill = action.get("skill", "stop")
 
                 if skill == "stop":
-                    reason = str(action.get("reason", "Goal complete"))
-                    print(f"[Agent] Stopping: {reason}")
-                    failure_keywords = ["fail", "error", "unable", "cannot", "impossible", "gave up"]
-                    is_failure = any(kw in reason.lower() for kw in failure_keywords)
-                    if is_failure:
-                        report.error = reason
-                    report.success = not is_failure
-                    break
+                    continuation = self._continuation_action_for_extraction(goal, state)
+                    if continuation:
+                        action = continuation
+                        skill = action["skill"]
+                        print(f"[Agent] Override stop: {action.get('reason')}")
+                    else:
+                        reason = str(action.get("reason", "Goal complete"))
+                        print(f"[Agent] Stopping: {reason}")
+                        failure_keywords = ["fail", "error", "unable", "cannot", "impossible", "gave up"]
+                        is_failure = any(kw in reason.lower() for kw in failure_keywords)
+                        if is_failure:
+                            report.error = reason
+                        report.success = not is_failure
+                        break
 
                 print(f"[Agent] Step {step}: {skill} - {action.get('reason', '')}")
                 params = action.get("params") or {}
-                if self._is_duplicate_action(skill, params):
+                original_skill, original_params = skill, dict(params)
+                skill, params, guarded_result = self._guard_verification_action(goal, state, skill, params)
+                skill, params, extraction_guarded = self._guard_extraction_action(state, skill, params)
+                if skill != original_skill or params != original_params:
+                    action = dict(action)
+                    action["skill"] = skill
+                    action["params"] = params
+                    if extraction_guarded:
+                        action["reason"] = "Guard: use detected data_region for extraction instead of a navigation/sidebar container."
+                    else:
+                        action["reason"] = "Guard: click verification-code button instead of guessing a code."
+                if guarded_result is not None:
+                    print(f"[Agent] Guarded verification action: {guarded_result.get('error')}")
+                    result = guarded_result
+                elif ENABLE_DUPLICATE_ACTION_BLOCKING and self._is_duplicate_action(skill, params):
                     print(f"[Agent] BLOCKED duplicate action: {skill} with same params. Forcing snapshot to refresh state.")
                     result = self.executor.snapshot(mode="agent_summary")
                     skill = "snapshot"
@@ -676,6 +1064,10 @@ class DPCLIAgent:
                     )
                     report.steps.append(agent_step)
                     self.history.append({"skill": skill, "params": action.get("params") or {}, "result": result})
+                    if callable(on_step):
+                        report.total_duration_ms = (time.time() - start_time) * 1000
+                        report.full_history = list(self.history)
+                        on_step(report)
                     continue
 
                 recoverable_errors = ["ref_stale", "ref_not_found", "element_not_found", "invalid_ref_type"]
@@ -693,6 +1085,10 @@ class DPCLIAgent:
                     )
                     report.steps.append(agent_step)
                     self.history.append({"skill": skill, "params": action.get("params") or {}, "result": result})
+                    if callable(on_step):
+                        report.total_duration_ms = (time.time() - start_time) * 1000
+                        report.full_history = list(self.history)
+                        on_step(report)
                     continue
 
                 # Record
@@ -706,13 +1102,24 @@ class DPCLIAgent:
                 report.steps.append(agent_step)
                 self.history.append({"skill": skill, "params": action.get("params") or {}, "result": result})
 
+                if callable(on_step):
+                    report.total_duration_ms = (time.time() - start_time) * 1000
+                    report.full_history = list(self.history)
+                    on_step(report)
+
                 # Analyze result
                 if skill == "extract" and result.get("ok"):
                     data = result.get("data") or {}
                     items = data.get("items", []) if isinstance(data, dict) else []
-                    report.items_extracted = len(items)
-                    report.extracted_data = data if isinstance(data, dict) else {}
+                    added = self._remember_extracted_items(data, state.get("url"))
+                    report.items_extracted = len(self.collected_items)
+                    report.extracted_data = self._extracted_payload()
                     if items:
+                        print(
+                            f"[Agent] Extracted page {self.extracted_pages}/{self.target_pages}, "
+                            f"added {added} new items (total: {len(self.collected_items)})"
+                        )
+                    if items and self.extracted_pages >= self.target_pages:
                         report.success = True
                         break
 
@@ -730,7 +1137,9 @@ class DPCLIAgent:
 
             else:
                 if self.collected_items:
-                    report.success = True
+                    report.success = self.extracted_pages >= self.target_pages
+                    if not report.success:
+                        report.error = f"Max steps reached after extracting {self.extracted_pages}/{self.target_pages} pages"
                 else:
                     report.error = "Max steps reached"
 
@@ -740,9 +1149,10 @@ class DPCLIAgent:
             traceback.print_exc()
 
         if self.collected_items:
-            report.extracted_data = {"items": self.collected_items}
+            report.extracted_data = self._extracted_payload()
             report.items_extracted = len(self.collected_items)
-            report.success = True
+            if self.extracted_pages >= self.target_pages:
+                report.success = True
 
         report.total_duration_ms = (time.time() - start_time) * 1000
         report.full_history = list(self.history)
@@ -755,16 +1165,32 @@ class TestRunner:
         self.results: list[AgentReport] = []
         self.headless = headless
 
-    def run_scenario(self, name: str, goal: str, max_steps: int = 20) -> AgentReport:
+    def run_scenario(self, name: str, goal: str, max_steps: int = MAX_STEPS) -> AgentReport:
         print(f"\n{'='*60}")
         print(f"Scenario: {name}")
         print(f"Goal: {goal}")
         print(f"{'='*60}")
 
+        log_dir = Path("log")
+        log_dir.mkdir(exist_ok=True)
+        existing = list(log_dir.glob(f"{name}_*.json"))
+        max_index = 0
+        for f in existing:
+            try:
+                idx = int(f.stem.rsplit("_", 1)[-1])
+                max_index = max(max_index, idx)
+            except ValueError:
+                continue
+        log_path = str(log_dir / f"{name}_{max_index + 1}.json")
+
         executor = DPCLIExecutor(session=f"test-{name}", headless=self.headless)
         agent = DPCLIAgent(self.llm, executor)
 
-        report = agent.run(goal, max_steps=max_steps)
+        def _on_step(report: AgentReport) -> None:
+            self._save_execution_log(name, report, log_path)
+            print(f"[Log] Step {len(report.steps)} saved to {log_path}")
+
+        report = agent.run(goal, max_steps=max_steps, on_step=_on_step)
         report.session_name = name
         self.results.append(report)
 
@@ -785,25 +1211,27 @@ class TestRunner:
             )
             print(f"[Result] Extracted data saved to: {output_file}")
 
-        log_path = self._save_execution_log(name, report)
+        self._save_execution_log(name, report, log_path)
         print(f"[Result] Execution log saved to: {log_path}")
 
         return report
 
-    def _save_execution_log(self, name: str, report: AgentReport) -> str:
+    def _save_execution_log(
+        self, name: str, report: AgentReport, log_path: str | None = None
+    ) -> str:
         log_dir = Path("log")
         log_dir.mkdir(exist_ok=True)
 
-        existing = list(log_dir.glob(f"{name}_*.json"))
-        max_index = 0
-        for f in existing:
-            try:
-                idx = int(f.stem.rsplit("_", 1)[-1])
-                max_index = max(max_index, idx)
-            except ValueError:
-                continue
-
-        log_path = log_dir / f"{name}_{max_index + 1}.json"
+        if log_path is None:
+            existing = list(log_dir.glob(f"{name}_*.json"))
+            max_index = 0
+            for f in existing:
+                try:
+                    idx = int(f.stem.rsplit("_", 1)[-1])
+                    max_index = max(max_index, idx)
+                except ValueError:
+                    continue
+            log_path = str(log_dir / f"{name}_{max_index + 1}.json")
 
         log_data = {
             "session_name": name,
@@ -828,7 +1256,7 @@ class TestRunner:
             "extracted_data": report.extracted_data,
         }
 
-        log_path.write_text(json.dumps(log_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(log_path).write_text(json.dumps(log_data, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(log_path)
 
     def print_summary(self):
@@ -862,7 +1290,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=DEFAULT_CONFIG["model"], help="Model name")
     parser.add_argument("--scenario", choices=list(SCENARIOS.keys()), help="Run a specific scenario")
     parser.add_argument("--goal", help="Custom natural language goal")
-    parser.add_argument("--max-steps", type=int, default=10, help="Max steps per scenario")
+    parser.add_argument("--max-steps", type=int, default=MAX_STEPS, help="Max steps per scenario")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
     parser.add_argument("--output", help="Save results to JSON file")
     parser.add_argument("--dry-run", action="store_true", help="Open URL and print snapshot index, then exit without LLM")
@@ -1040,12 +1468,12 @@ def test_params_null_handling():
     print("  PASSED: open with params=None")
 
     result = agent.execute_skill("expand", {"ref": "r1", "depth": None})
-    mock_executor.expand.assert_called_with("r1", 2)
-    print("  PASSED: expand with depth=null defaults to 2")
+    mock_executor.expand.assert_called_with("r1", DEFAULT_EXPAND_DEPTH)
+    print(f"  PASSED: expand with depth=null defaults to {DEFAULT_EXPAND_DEPTH}")
 
     result = agent.execute_skill("list-items", {"group_ref": "r1", "sample_size": None})
-    mock_executor.list_items.assert_called_with("r1", 3)
-    print("  PASSED: list-items with sample_size=null defaults to 3")
+    mock_executor.list_items.assert_called_with("r1", DEFAULT_SAMPLE_SIZE)
+    print(f"  PASSED: list-items with sample_size=null defaults to {DEFAULT_SAMPLE_SIZE}")
 
     print("All params null handling tests passed!")
 
