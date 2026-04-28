@@ -565,6 +565,192 @@ return {
 };
 """
 
+DETAIL_EXTRACTION_SCRIPT = SHARED_JS_HELPERS + """
+(() => {
+  const text = node => compactText((node && (node.innerText || node.textContent)) || '');
+  const attr = (node, name) => (node && node.getAttribute && node.getAttribute(name)) || '';
+  const visibleElements = selector => Array.from(document.querySelectorAll(selector)).filter(isVisible);
+  const firstText = selectors => {
+    for (const selector of selectors) {
+      for (const node of visibleElements(selector)) {
+        const value = text(node);
+        if (value) return value;
+      }
+    }
+    return '';
+  };
+
+  const title = firstText([
+    'h1',
+    '.title',
+    '[class*="title"]',
+    '[class*="name"]',
+    '.vodh h2',
+    '.vodh h1'
+  ]) || compactText(document.title || '');
+
+  const labels = [
+    ['director', ['director', '\\u5bfc\\u6f14']],
+    ['actors', ['actor', 'actors', 'cast', '\\u4e3b\\u6f14', '\\u6f14\\u5458']],
+    ['category', ['category', 'genre', 'type', '\\u7c7b\\u578b']],
+    ['region', ['region', 'area', '\\u5730\\u533a']],
+    ['year', ['year', '\\u5e74\\u4efd', '\\u5e74\\u4ee3']],
+    ['language', ['language', '\\u8bed\\u8a00']],
+    ['release_date', ['release', '\\u4e0a\\u6620', '\\u53d1\\u884c']],
+    ['updated_at', ['update', 'updated', '\\u66f4\\u65b0', '\\u66f4\\u65b0\\u65f6\\u95f4']]
+  ];
+
+  const detailInfo = {};
+  if (title) detailInfo.title = title;
+  const lines = text(document.body).split(/\\n+/).map(line => compactText(line)).filter(Boolean);
+  for (const line of lines) {
+    if (line.length > 180) continue;
+    for (const [field, names] of labels) {
+      if (detailInfo[field]) continue;
+      for (const name of names) {
+        const index = line.toLowerCase().indexOf(name.toLowerCase());
+        if (index < 0) continue;
+        let value = line.slice(index + name.length).replace(/^[\\s:：\\-]+/, '').trim();
+        if (!value && line.includes('：')) value = line.split('：').slice(1).join('：').trim();
+        if (!value && line.includes(':')) value = line.split(':').slice(1).join(':').trim();
+        if (value && value.length <= 160) {
+          detailInfo[field] = value;
+          break;
+        }
+      }
+    }
+  }
+
+  const descSelectors = [
+    '[class*="desc"]',
+    '[id*="desc"]',
+    '[class*="content"]',
+    '[id*="content"]',
+    '[class*="plot"]',
+    '[class*="intro"]',
+    '.vod_content',
+    '.vodplayinfo'
+  ];
+  let description = '';
+  for (const selector of descSelectors) {
+    for (const node of visibleElements(selector)) {
+      const value = text(node);
+      if (value && value.length > description.length) description = value;
+    }
+  }
+  if (!description) {
+    for (const node of visibleElements('p')) {
+      const value = text(node);
+      if (value.length > description.length) description = value;
+    }
+  }
+  if (description) detailInfo.description = description.slice(0, 3000);
+
+  const imageCandidates = visibleElements('img')
+    .map(node => ({
+      src: node.currentSrc || attr(node, 'src') || attr(node, 'data-src') || attr(node, 'data-original'),
+      alt: attr(node, 'alt'),
+      area: Math.max(1, node.getBoundingClientRect().width * node.getBoundingClientRect().height)
+    }))
+    .filter(item => item.src);
+  imageCandidates.sort((a, b) => b.area - a.area);
+  if (imageCandidates[0]) {
+    detailInfo.cover = new URL(imageCandidates[0].src, location.href).href;
+    if (imageCandidates[0].alt && !detailInfo.title) detailInfo.title = imageCandidates[0].alt;
+  }
+
+  const playUrls = visibleElements('a[href]')
+    .map(node => ({
+      text: text(node),
+      url: new URL(attr(node, 'href'), location.href).href
+    }))
+    .filter(item => {
+      const haystack = (item.text + ' ' + item.url).toLowerCase();
+      return /play|m3u8|episode|ep\\d+|vod-play|\\u64ad\\u653e|\\u7b2c\\d+/.test(haystack);
+    });
+  const seenPlayUrls = new Set();
+  detailInfo.play_urls = playUrls.filter(item => {
+    if (seenPlayUrls.has(item.url)) return false;
+    seenPlayUrls.add(item.url);
+    return true;
+  }).slice(0, 100);
+
+  const fields = Object.keys(detailInfo);
+  return {
+    source_url: location.href,
+    page_title: compactText(document.title || ''),
+    fields,
+    detail_info: detailInfo,
+    template: {
+      extract_strategy: 'dp_cli_detail_js_v1',
+      fields,
+      selectors: {
+        title: 'h1, .title, [class*=title], [class*=name], .vodh h2, .vodh h1',
+        meta: 'body text label scan',
+        description: descSelectors.join(', '),
+        cover: 'largest visible img',
+        play_urls: 'a[href] filtered by play keywords'
+      }
+    }
+  };
+})()
+"""
+
+DETAIL_PAGE_PACKAGE_SCRIPT = SHARED_JS_HELPERS + """
+(() => {
+  const text = node => compactText((node && (node.innerText || node.textContent)) || '');
+  const attr = (node, name) => (node && node.getAttribute && node.getAttribute(name)) || '';
+  const visibleElements = selector => Array.from(document.querySelectorAll(selector)).filter(isVisible);
+  const truncate = (value, size) => {
+    const compact = compactText(value || '');
+    return compact.length > size ? compact.slice(0, size) : compact;
+  };
+
+  const headings = visibleElements('h1,h2,h3')
+    .map(node => ({tag: (node.tagName || '').toLowerCase(), text: truncate(text(node), 180)}))
+    .filter(item => item.text)
+    .slice(0, 30);
+
+  const links = visibleElements('a[href]')
+    .map(node => ({
+      text: truncate(text(node), 160),
+      url: new URL(attr(node, 'href'), location.href).href
+    }))
+    .filter(item => item.text || item.url)
+    .slice(0, 80);
+
+  const images = visibleElements('img')
+    .map(node => ({
+      alt: truncate(attr(node, 'alt'), 120),
+      src: node.currentSrc || attr(node, 'src') || attr(node, 'data-src') || attr(node, 'data-original'),
+      area: Math.round(Math.max(1, node.getBoundingClientRect().width * node.getBoundingClientRect().height))
+    }))
+    .filter(item => item.src)
+    .sort((a, b) => b.area - a.area)
+    .slice(0, 20)
+    .map(item => ({alt: item.alt, src: new URL(item.src, location.href).href}));
+
+  const tables = visibleElements('table')
+    .map(table => Array.from(table.querySelectorAll('tr')).slice(0, 12).map(row =>
+      Array.from(row.querySelectorAll('th,td')).slice(0, 8).map(cell => truncate(text(cell), 120))
+    ).filter(row => row.some(Boolean)))
+    .filter(rows => rows.length)
+    .slice(0, 5);
+
+  const mainNode = document.querySelector('main, article, [role="main"]') || document.body;
+  return {
+    url: location.href,
+    title: compactText(document.title || ''),
+    headings,
+    main_text: truncate(text(mainNode), 9000),
+    body_text: truncate(text(document.body), 12000),
+    links,
+    images,
+    tables
+  };
+})()
+"""
+
 PREFERRED_CLICK_OFFSET_SCRIPT = SHARED_JS_HELPERS + """
 function localClassText(node) {
   const raw = node.className || '';
@@ -645,8 +831,11 @@ class DrissionPageAdapter:
             "tab_id": getattr(tab, "tab_id", None),
         }
 
-    def open_url(self, tab, url: str) -> dict:
-        tab.get(url)
+    def open_url(self, tab, url: str, timeout: float | None = None) -> dict:
+        if timeout is not None and timeout > 0:
+            tab.get(url, timeout=timeout)
+        else:
+            tab.get(url)
         return self.page_info(tab)
 
     def snapshot_nodes(self, tab, root_xpath: str | None = None, depth: int | None = None) -> list[SnapshotNodeRecord]:
@@ -670,6 +859,12 @@ class DrissionPageAdapter:
 
     def element_state(self, element) -> dict:
         return element.run_js(ELEMENT_STATE_SCRIPT)
+
+    def extract_detail(self, tab) -> dict:
+        return tab.run_js(DETAIL_EXTRACTION_SCRIPT, as_expr=True)
+
+    def detail_page_package(self, tab) -> dict:
+        return tab.run_js(DETAIL_PAGE_PACKAGE_SCRIPT, as_expr=True)
 
     def scroll_into_view(self, element) -> None:
         element.run_js("this.scrollIntoView({block: 'center', inline: 'center'});")

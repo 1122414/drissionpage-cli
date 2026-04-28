@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,10 @@ except ImportError:
 MAX_STEPS = 50
 LLM_TIMEOUT = 60
 SUBPROCESS_TIMEOUT = 60
+DETAIL_BATCH_MIN_TIMEOUT = 600
+DETAIL_BATCH_PER_ITEM_TIMEOUT = 90
+DETAIL_BATCH_ITEM_TIMEOUT = 120
+DETAIL_BATCH_AI_TIMEOUT = 45
 LLM_TEMPERATURE = 0
 COMPACT_HISTORY_LIMIT = 10
 LAST_RESULTS_LIMIT = 10
@@ -52,7 +57,15 @@ SCENARIOS = {
 
     # 成功，scrawl_5.json
     # "scrawl": "去这个网站，https://www.wangfei.la/，进入左侧电影栏目，爬取前两页的电影信息，并存储为json文件",
-    "scrawl_info": "去这个网站，https://www.wangfei.la/，进入左侧电影栏目，爬取前两页的电影信息，注意要点进每一部电影去获取其详情信息，并存储为json文件"
+
+    # 成功detail_batch_input_test-scrawl_info_1777285872.json
+    # "scrawl_info": "去这个网站，https://www.wangfei.la/，进入左侧电影栏目，爬取前两页的电影信息，注意要点进每一部电影去获取其详情信息，并存储为json文件"
+
+    # 未成功
+    "scrawl_info_rank_info": "去这个网站，http://guozhivip.com/rank/，爬取主页栏目中各个榜单的详细信息，注意要点击进去"
+
+    # test_download 成功
+    # "download_music": "去这个网站，https://www.fangpi.net/，搜索那天下雨了，选择第一个选项，然后下载歌词"
     
 }
 
@@ -139,56 +152,113 @@ class DPCLIExecutor:
         self.session = session
         self.headless = headless
 
-    def _run(self, *args) -> dict[str, Any]:
+    def _run(self, *args, command_timeout: float | int | None = None) -> dict[str, Any]:
         import subprocess
         cmd = ["python", "-m", "dp_cli", *args]
         if self.headless:
             cmd.append("--headless")
         cmd.extend(["--session", self.session])
         print(f"[DEBUG] cmd: {' '.join(cmd)}")
-        result = None
+        timeout = command_timeout
+        if timeout is None:
+            timeout = SUBPROCESS_TIMEOUT * 5 if args and args[0] == "batch-detail-extract" else SUBPROCESS_TIMEOUT
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=SUBPROCESS_TIMEOUT,
                 encoding="utf-8",
                 errors="replace",
             )
-            print(f"[DEBUG] returncode: {result.returncode}")
-            stdout_preview = result.stdout[:500] if result.stdout is not None else 'None'
-            stderr_preview = result.stderr[:500] if result.stderr is not None else 'None'
-            print(f"[DEBUG] stdout: {stdout_preview}")
-            print(f"[DEBUG] stderr: {stderr_preview}")
-            if result.returncode != 0:
+
+            def collect_stdout() -> None:
+                if process.stdout is None:
+                    return
+                for line in process.stdout:
+                    stdout_chunks.append(line)
+
+            def collect_stderr() -> None:
+                if process.stderr is None:
+                    return
+                for line in process.stderr:
+                    stderr_chunks.append(line)
+                    print(line, end="")
+
+            stdout_thread = threading.Thread(target=collect_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=collect_stderr, daemon=True)
+            stdout_thread.start()
+            stderr_thread.start()
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait()
+                stdout_thread.join()
+                stderr_thread.join()
+                stdout = "".join(stdout_chunks)
+                stderr = "".join(stderr_chunks)
                 return {
                     "ok": False,
-                    "error": result.stderr or f"Exit code {result.returncode}",
-                    "stdout": result.stdout,
+                    "error": f"Timeout after {timeout}s",
+                    "stdout": stdout,
+                    "stderr": stderr,
                 }
-            if result.stdout is None:
+
+            stdout_thread.join()
+            stderr_thread.join()
+            stdout = "".join(stdout_chunks)
+            stderr = "".join(stderr_chunks)
+            print(f"[DEBUG] returncode: {returncode}")
+            stdout_preview = stdout[:500] if stdout is not None else 'None'
+            stderr_preview = stderr[:500] if stderr is not None else 'None'
+            print(f"[DEBUG] stdout: {stdout_preview}")
+            print(f"[DEBUG] stderr: {stderr_preview}")
+            if returncode != 0:
+                return {
+                    "ok": False,
+                    "error": stderr or f"Exit code {returncode}",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+            if stdout is None:
                 return {"ok": False, "error": "No output from command (stdout is None)"}
-            parsed = json.loads(result.stdout)
+            parsed = json.loads(stdout)
             if not isinstance(parsed, dict):
-                return {"ok": False, "error": f"Expected JSON object, got {type(parsed).__name__}", "raw": result.stdout}
+                return {"ok": False, "error": f"Expected JSON object, got {type(parsed).__name__}", "raw": stdout}
             return parsed
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": f"Timeout after {SUBPROCESS_TIMEOUT}s"}
         except json.JSONDecodeError:
-            return {"ok": False, "error": "Invalid JSON output", "raw": result.stdout if result else None}
+            return {"ok": False, "error": "Invalid JSON output", "raw": "".join(stdout_chunks) or None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def open(self, url: str) -> dict[str, Any]:
-        return self._run("open", url)
+    def _wait_args(self, wait_time: float | int | None = None) -> list[str]:
+        if wait_time is None:
+            return []
+        try:
+            value = float(wait_time)
+        except (TypeError, ValueError):
+            return []
+        return ["--wait-time", str(value)] if value > 0 else []
 
-    def snapshot(self, mode: str = "agent_summary", ref: str | None = None, depth: int | None = None) -> dict[str, Any]:
+    def open(self, url: str, wait_time: float | int | None = None) -> dict[str, Any]:
+        return self._run("open", url, *self._wait_args(wait_time))
+
+    def snapshot(
+        self,
+        mode: str = "agent_summary",
+        ref: str | None = None,
+        depth: int | None = None,
+        wait_time: float | int | None = None,
+    ) -> dict[str, Any]:
         args = ["snapshot", "--mode", mode or "agent_summary"]
         if ref:
             args.extend([ref])
         if depth is not None:
             args.extend(["--depth", str(depth)])
+        args.extend(self._wait_args(wait_time))
         return self._run(*args)
 
     def expand(self, ref: str, depth: int = 2) -> dict[str, Any]:
@@ -197,38 +267,115 @@ class DPCLIExecutor:
     def list_items(self, group_ref: str, sample_size: int = 3) -> dict[str, Any]:
         return self._run("list-items", group_ref, "--sample-size", str(sample_size))
 
-    def extract(self, target_ref: str, schema: list[str] | None = None, limit: int | None = None) -> dict[str, Any]:
+    def extract(
+        self,
+        target_ref: str,
+        schema: list[str] | None = None,
+        limit: int | None = None,
+        wait_time: float | int | None = None,
+    ) -> dict[str, Any]:
         args = ["extract", target_ref]
         if schema:
             args.extend(["--schema", *schema])
         if limit is not None and limit > 0:
             args.extend(["--limit", str(limit)])
+        args.extend(self._wait_args(wait_time))
         return self._run(*args)
 
-    def find(self, text: str | None = None, locator: str | None = None) -> dict[str, Any]:
+    def find(
+        self,
+        text: str | None = None,
+        locator: str | None = None,
+        wait_time: float | int | None = None,
+    ) -> dict[str, Any]:
         args = ["find"]
         if text:
             args.extend(["--text", text])
         if locator:
             args.extend(["--locator", locator])
+        args.extend(self._wait_args(wait_time))
         return self._run(*args)
 
-    def click(self, ref: str | None = None, locator: str | None = None) -> dict[str, Any]:
+    def click(
+        self,
+        ref: str | None = None,
+        locator: str | None = None,
+        wait_time: float | int | None = None,
+    ) -> dict[str, Any]:
         args = ["click"]
         if ref:
             args.extend(["--ref", ref])
         if locator:
             args.extend(["--locator", locator])
+        args.extend(self._wait_args(wait_time))
         return self._run(*args)
 
-    def type_text(self, ref: str, text: str) -> dict[str, Any]:
-        return self._run("type", "--ref", ref, "--text", text)
+    def type_text(self, ref: str, text: str, wait_time: float | int | None = None) -> dict[str, Any]:
+        return self._run("type", "--ref", ref, "--text", text, *self._wait_args(wait_time))
 
     def resolve_locator(self, ref: str) -> dict[str, Any]:
         return self._run("resolve-locator", "--ref", ref)
 
     def eval_js(self, js: str) -> dict[str, Any]:
         return self._run("eval", js)
+
+    def batch_detail_extract(
+        self,
+        items: list[dict[str, Any]],
+        source_url: str | None = None,
+        target_pages: int | None = None,
+        list_pages_extracted: int | None = None,
+        limit: int | None = None,
+        schema: list[str] | None = None,
+        extractor: str = "ai",
+        navigation_mode: str = "click",
+        fallback_mode: str = "direct",
+        wait_time: float | int | None = None,
+        wait_jitter: float | int | None = None,
+        max_retries: int | None = None,
+        item_timeout: float | int | None = None,
+        ai_timeout: float | int | None = None,
+        output_file: str | None = None,
+        progress_file: str | None = None,
+        command_timeout: float | int | None = None,
+    ) -> dict[str, Any]:
+        log_dir = Path("log")
+        log_dir.mkdir(exist_ok=True)
+        safe_session = re.sub(r"[^a-zA-Z0-9_.-]+", "_", self.session)
+        input_file = log_dir / f"detail_batch_input_{safe_session}_{int(time.time())}.json"
+        input_file.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        args = ["batch-detail-extract", "--items-file", str(input_file)]
+        if source_url:
+            args.extend(["--source-url", source_url])
+        if target_pages is not None:
+            args.extend(["--target-pages", str(target_pages)])
+        if list_pages_extracted is not None:
+            args.extend(["--list-pages-extracted", str(list_pages_extracted)])
+        if limit is not None and limit > 0:
+            args.extend(["--limit", str(limit)])
+        if schema:
+            args.extend(["--schema", *schema])
+        args.extend(["--extractor", extractor, "--navigation-mode", navigation_mode, "--fallback-mode", fallback_mode])
+        args.extend(self._wait_args(wait_time))
+        if wait_jitter is not None:
+            args.extend(["--wait-jitter", str(wait_jitter)])
+        if max_retries is not None:
+            args.extend(["--max-retries", str(max_retries)])
+        if item_timeout is not None:
+            args.extend(["--item-timeout", str(item_timeout)])
+        if ai_timeout is not None:
+            args.extend(["--ai-timeout", str(ai_timeout)])
+        if output_file:
+            args.extend(["--output-file", output_file])
+        if progress_file:
+            args.extend(["--progress-file", progress_file])
+        if command_timeout is None:
+            command_timeout = self._batch_command_timeout(len(items))
+        return self._run(*args, command_timeout=command_timeout)
+
+    def _batch_command_timeout(self, item_count: int) -> int:
+        return max(DETAIL_BATCH_MIN_TIMEOUT, int(max(1, item_count) * DETAIL_BATCH_PER_ITEM_TIMEOUT))
 
     def session_inspect(self) -> dict[str, Any]:
         return self._run("session", "inspect")
@@ -240,8 +387,17 @@ class DPCLIAgent:
         self.executor = executor
         self.history: list[dict[str, Any]] = []
         self.total_tokens = 0
-        self.collected_items: list[dict] = []
-        self.extracted_pages = 0
+        self.list_items: list[dict[str, Any]] = []
+        self.detail_items: list[dict[str, Any]] = []
+        self.detail_urls: list[str] = []
+        self.list_pages_extracted = 0
+        self.detail_pages_extracted = 0
+        self.detail_schema_learned = False
+        self.detail_template: dict[str, Any] | None = None
+        self.detail_batch_ran = False
+        self.is_detail_crawler = False
+        self.collected_items = self.list_items
+        self.extracted_pages = self.list_pages_extracted
         self.extracted_keys: set[str] = set()
         self.last_extracted_page_url: str | None = None
         self.target_pages = 1
@@ -284,6 +440,10 @@ class DPCLIAgent:
             items = data.get("items", [])
             record["item_count"] = len(items)
             record["fields"] = data.get("fields", [])
+        elif skill == "batch-detail-extract":
+            record["item_count"] = data.get("item_count", 0)
+            record["detail_pages_extracted"] = data.get("detail_pages_extracted", 0)
+            record["detail_schema_learned"] = data.get("detail_schema_learned", False)
         elif skill == "eval":
             record["result_preview"] = str(data.get("result", ""))[:120]
         elif skill == "snapshot":
@@ -327,7 +487,7 @@ class DPCLIAgent:
             safe["target_ref"] = params["target_ref"]
         if skill in ("click", "find") and "locator" in params:
             safe["locator"] = params["locator"]
-        if skill == "type" and "text" in params:
+        if skill == "type" and "text" in params and "locator" not in params:
             safe["text"] = params["text"]
         if skill == "type" and "locator" in params:
             safe["locator"] = params["locator"]
@@ -342,7 +502,7 @@ class DPCLIAgent:
             "You are a browser automation planner. Analyze the user's goal and break it into steps.\n"
             "Return a JSON object with:\n"
             '- "url": the starting URL (extract from goal if present)\n'
-            '- "task_type": "automation" | "crawler" | "hybrid"\n'
+            '- "task_type": "automation" | "crawler" | "detail_crawler" | "hybrid"\n'
             '- "steps": list of high-level steps\n'
             '- "expected_skills": list of dp_cli skills needed (e.g., ["snapshot", "click", "extract"])\n\n'
             f"Goal: {goal}\n\n"
@@ -385,10 +545,15 @@ class DPCLIAgent:
             "   - If an action fails (ok=false), do NOT blindly retry the same action. Try a different approach (e.g., use find instead of ref).\n\n"
             "CRAWLER / EXTRACTION RULES:\n"
             "- current_state may contain data_regions. These are the preferred containers for list extraction.\n"
-            "- If data_regions is present, use extract with data_regions[0].ref and schema [\"title\", \"url\"] before expanding/clicking unrelated navigation containers.\n"
-            "- Do not extract from sidebar, category, filter, ranking, or navigation containers when a data_region exists.\n"
-            "- For goals asking for multiple pages, extract the current list page, navigate to the next page, then extract again. Do not stop after the first successful extract unless extraction_progress.pages_extracted has reached extraction_progress.target_pages.\n"
+            "- If data_regions is present, use extract with data_regions[0].ref before expanding/clicking unrelated navigation containers. Add schema only when the user requested specific fields.\n"
+            "- Do not extract from sidebar, category tabs, filter controls, or navigation containers when a content data_region exists.\n"
+            "- For goals asking for multiple pages, extract the current list page, navigate to the next page, then extract again. Do not stop after the first successful extract unless extraction_progress.list_pages_extracted has reached extraction_progress.target_pages.\n"
             "- If you need the next page control and it is not visible, use find with text \"next\" or the site's next-page label, then click the returned link/button.\n\n"
+            "DETAIL CRAWLER RULES:\n"
+            "- If the goal asks for detail info, detail pages, or clicking into every item, list-page extract is only stage 1 and is NOT task completion.\n"
+            "- First collect all target list-page detail URLs. Do not stop while extraction_progress.list_pages_extracted is below extraction_progress.target_pages.\n"
+            "- After enough list URLs are collected, the Agent Loop will run dp_cli batch-detail-extract with auto detail extraction, polite wait_time, progress files, and a long batch timeout. Do NOT manually snapshot every detail page for the LLM.\n"
+            "- You may inspect at most the first detail page if native list extraction fails, but never perform per-item LLM extraction loops.\n\n"
             "REGISTRATION FORM RULES:\n"
             "- The main loop already gives you a fresh page-level snapshot before every decision. Do NOT choose page-level snapshot just to confirm a prior click/type; use current_state and last_results instead.\n"
             "- Use field names, placeholder, label, input_type, and filled/checked state to map fields. Never type a password into a verification/captcha/code field.\n"
@@ -421,7 +586,7 @@ class DPCLIAgent:
             '- find: {"skill": "find", "params": {"text": "搜索"}}\n'
             '- type: {"skill": "type", "params": {"ref": "e12", "text": "进击的巨人"}}\n'
             '- click: {"skill": "click", "params": {"ref": "e13"}}\n'
-            '- extract: {"skill": "extract", "params": {"target_ref": "r2", "schema": ["title", "url"], "limit": 5}}\n\n'
+            '- extract: {"skill": "extract", "params": {"target_ref": "r2", "limit": 5}}\n\n'
             "recent_actions shows your last 3 actions. If the last action was type/click with ok=true, you MUST choose a DIFFERENT next action (do NOT repeat).\n"
             "last_results shows the outcomes of your last 5 successful operations. If you previously used find and got results, those refs are still valid — you do NOT need to find again. Use the refs from last_results directly.\n\n"
             "Choose the next action based on the current state and goal.\n\n"
@@ -446,12 +611,13 @@ class DPCLIAgent:
             url = params.get("url")
             if not url:
                 return {"ok": False, "error": "open requires 'url' param (e.g., 'https://example.com')"}
-            return self.executor.open(url)
+            return self.executor.open(url, wait_time=params.get("wait_time"))
         elif skill == "snapshot":
             return self.executor.snapshot(
                 mode=params.get("mode") or "agent_summary",
                 ref=params.get("ref"),
                 depth=params.get("depth"),
+                wait_time=params.get("wait_time"),
             )
         elif skill == "expand":
             ref = params.get("ref")
@@ -460,9 +626,9 @@ class DPCLIAgent:
             depth = params.get("depth")
             return self.executor.expand(ref, depth if depth is not None else DEFAULT_EXPAND_DEPTH)
         elif skill == "find":
-            return self.executor.find(text=params.get("text"), locator=params.get("locator"))
+            return self.executor.find(text=params.get("text"), locator=params.get("locator"), wait_time=params.get("wait_time"))
         elif skill == "click":
-            return self.executor.click(ref=params.get("ref"), locator=params.get("locator"))
+            return self.executor.click(ref=params.get("ref"), locator=params.get("locator"), wait_time=params.get("wait_time"))
         elif skill == "type":
             ref = params.get("ref")
             text = params.get("text")
@@ -470,7 +636,7 @@ class DPCLIAgent:
                 return {"ok": False, "error": "type requires 'ref' param (element ref like 'e1', 'e5')"}
             if text is None:
                 return {"ok": False, "error": "type requires 'text' param (string to type)"}
-            return self.executor.type_text(ref, text)
+            return self.executor.type_text(ref, text, wait_time=params.get("wait_time"))
         elif skill == "list-items":
             group_ref = params.get("group_ref")
             if not group_ref:
@@ -485,6 +651,7 @@ class DPCLIAgent:
                 target_ref,
                 schema=params.get("schema"),
                 limit=params.get("limit"),
+                wait_time=params.get("wait_time"),
             )
         elif skill == "resolve-locator":
             ref = params.get("ref")
@@ -621,11 +788,15 @@ class DPCLIAgent:
         if self.last_results:
             result["last_results"] = self.last_results[-5:]
 
-        if self.target_pages > 1 or self.extracted_pages or self.collected_items:
+        if self.target_pages > 1 or self.list_pages_extracted or self.list_items or self.is_detail_crawler:
             result["extraction_progress"] = {
                 "target_pages": self.target_pages,
-                "pages_extracted": self.extracted_pages,
-                "items_collected": len(self.collected_items),
+                "list_pages_extracted": self.list_pages_extracted,
+                "list_items_collected": len(self.list_items),
+                "detail_crawler": self.is_detail_crawler,
+                "detail_urls_collected": len(self.detail_urls),
+                "detail_batch_ran": self.detail_batch_ran,
+                "detail_pages_extracted": self.detail_pages_extracted,
                 "last_extracted_page_url": self.last_extracted_page_url,
             }
 
@@ -658,6 +829,10 @@ class DPCLIAgent:
         item_count = item.get("item_count") or item.get("_data_region_item_count")
         if item_count:
             compact["item_count"] = item_count
+        for key in ("kind", "score", "why"):
+            value = item.get(key)
+            if value:
+                compact[key] = value
         sample_items = item.get("sample_items")
         if isinstance(sample_items, list) and sample_items:
             compact["sample_items"] = sample_items[:3]
@@ -703,6 +878,8 @@ class DPCLIAgent:
             return 2
         if any(token in goal for token in ("\u524d\u4e24\u9875", "\u4e24\u9875", "2\u9875")):
             return 2
+        if any(token in goal for token in ("鍓嶄袱", "涓ら", "2椤")):
+            return 2
         patterns = (
             r"\u524d\s*(\d+)\s*\u9875",
             r"(\d+)\s*\u9875",
@@ -728,6 +905,35 @@ class DPCLIAgent:
                 "\u4fdd\u5b58",
                 "\u7535\u5f71",
                 "\u4fe1\u606f",
+                "鐖",
+                "瀛樺偍",
+                "鐢靛奖",
+                "淇℃伅",
+            )
+        )
+
+    def _goal_requests_detail_crawl(self, goal: str) -> bool:
+        lower_goal = goal.lower()
+        if any(token in lower_goal for token in ("detail", "detail page", "details", "click into", "click through")):
+            return True
+        if any(token in goal for token in ("璇︽儏", "鐐硅繘", "姣忎竴", "鍏惰", "鎯呬俊鎭")):
+            return True
+        return any(
+            token in goal
+            for token in (
+                "\u8be6\u60c5\u4fe1\u606f",
+                "\u8be6\u7ec6\u4fe1\u606f",
+                "\u699c\u5355\u7684\u8be6\u7ec6",
+                "\u699c\u5355\u8be6\u7ec6",
+                "\u70b9\u51fb\u8fdb\u53bb",
+                "\u70b9\u8fdb\u53bb",
+                "\u70b9\u8fdb\u6bcf\u4e00\u90e8",
+                "\u8fdb\u5165\u6bcf\u4e00\u90e8",
+                "\u8fdb\u5165\u9875\u9762",
+                "\u6bcf\u4e2a\u8be6\u60c5\u9875",
+                "\u8be6\u60c5\u9875",
+                "\u83b7\u53d6\u5176\u8be6\u60c5",
+                "\u8be6\u60c5",
             )
         )
 
@@ -736,16 +942,41 @@ class DPCLIAgent:
         if not isinstance(regions, list):
             return None
         best_ref = None
-        best_count = -1
+        best_score = -1
         for item in regions:
             if not isinstance(item, dict):
                 continue
             ref = item.get("ref")
             item_count = item.get("item_count") or item.get("_data_region_item_count") or 0
-            if ref and item_count > best_count:
+            score = item.get("score")
+            try:
+                rank_score = int(score if score is not None else item_count)
+            except (TypeError, ValueError):
+                rank_score = int(item_count or 0)
+            if ref and rank_score > best_score:
                 best_ref = ref
-                best_count = int(item_count)
+                best_score = rank_score
         return best_ref
+
+    def _detail_list_collection_action(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.is_detail_crawler or self.list_items:
+            return None
+        region_ref = self._best_data_region_ref(state)
+        if region_ref:
+            return {
+                "skill": "extract",
+                "params": {"target_ref": region_ref},
+                "reason": "Guard: detail crawl must first collect homepage ranking/detail links from the best data_region instead of clicking surface category tabs.",
+            }
+        source_url = self._source_url()
+        current_url = state.get("url")
+        if source_url and current_url and current_url != source_url:
+            return {
+                "skill": "open",
+                "params": {"url": source_url},
+                "reason": "Guard: return to the source listing page before collecting detail links.",
+            }
+        return None
 
     def _guard_extraction_action(
         self,
@@ -764,13 +995,33 @@ class DPCLIAgent:
         guarded_params = dict(params)
         guarded_params.pop("ref", None)
         guarded_params["target_ref"] = best_ref
-        guarded_params.setdefault("schema", ["title", "url"])
         return skill, guarded_params, True
 
     def _item_key(self, item: dict[str, Any]) -> str:
-        url = str(item.get("url") or "").strip()
+        url = str(item.get("detail_url") or item.get("url") or item.get("href") or "").strip()
         title = str(item.get("title") or item.get("name") or "").strip()
         return url or title or json.dumps(item, ensure_ascii=False, sort_keys=True)
+
+    def _normalize_list_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(item)
+        detail_url = normalized.get("detail_url") or normalized.get("url") or normalized.get("href")
+        if detail_url:
+            normalized["detail_url"] = detail_url
+            normalized.setdefault("url", detail_url)
+        return normalized
+
+    def _refresh_detail_urls(self) -> None:
+        urls = []
+        seen = set()
+        for item in self.list_items:
+            url = item.get("detail_url") or item.get("url") or item.get("href")
+            if not isinstance(url, str) or not url.strip():
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        self.detail_urls = urls
 
     def _remember_extracted_items(self, data: dict[str, Any], page_url: str | None) -> int:
         items = data.get("items", []) if isinstance(data, dict) else []
@@ -784,21 +1035,167 @@ class DPCLIAgent:
             if key in self.extracted_keys:
                 continue
             self.extracted_keys.add(key)
-            self.collected_items.append(item)
+            self.list_items.append(self._normalize_list_item(item))
             added += 1
         if page_url and page_url == self.last_extracted_page_url:
+            self._refresh_detail_urls()
             return added
-        self.extracted_pages += 1
+        self.list_pages_extracted += 1
+        self.extracted_pages = self.list_pages_extracted
         self.last_extracted_page_url = page_url
+        self._refresh_detail_urls()
         return added
 
     def _extracted_payload(self) -> dict[str, Any]:
+        if self.is_detail_crawler:
+            return {
+                "task_type": "detail_crawler",
+                "source_url": self._source_url(),
+                "target_pages": self.target_pages,
+                "list_pages_extracted": self.list_pages_extracted,
+                "detail_pages_extracted": self.detail_pages_extracted,
+                "detail_schema_learned": self.detail_schema_learned,
+                "detail_template": self.detail_template,
+                "item_count": len(self.detail_items or self.list_items),
+                "items": self.detail_items or [
+                    {
+                        "title": item.get("title") or item.get("name"),
+                        "url": item.get("detail_url") or item.get("url"),
+                        "list_info": item,
+                        "detail_info": {},
+                        "detail_ok": False,
+                        "detail_error": "Detail batch has not run yet.",
+                    }
+                    for item in self.list_items
+                ],
+            }
         return {
-            "item_count": len(self.collected_items),
-            "pages_extracted": self.extracted_pages,
+            "task_type": "crawler",
+            "item_count": len(self.list_items),
+            "pages_extracted": self.list_pages_extracted,
             "target_pages": self.target_pages,
-            "items": self.collected_items,
+            "items": self.list_items,
         }
+
+    def _source_url(self) -> str | None:
+        for item in self.history:
+            if item.get("skill") == "open":
+                params = item.get("params") or {}
+                url = params.get("url")
+                if isinstance(url, str):
+                    return url
+        return None
+
+    def _detail_crawler_ready_for_batch(self) -> bool:
+        return (
+            self.is_detail_crawler
+            and not self.detail_batch_ran
+            and self.list_pages_extracted >= self.target_pages
+            and bool(self.detail_urls)
+        )
+
+    def _detail_crawler_success(self) -> bool:
+        if not self.is_detail_crawler:
+            return self.list_pages_extracted >= self.target_pages and bool(self.list_items)
+        return (
+            self.list_pages_extracted >= self.target_pages
+            and bool(self.detail_urls)
+            and self.detail_batch_ran
+            and self.detail_pages_extracted > 0
+            and any(item.get("detail_ok") and item.get("detail_info") for item in self.detail_items)
+        )
+
+    def _run_detail_batch(self, report: AgentReport) -> dict[str, Any]:
+        print(
+            f"[Agent] Running deterministic detail batch for {len(self.detail_urls)} URLs "
+            f"after {self.list_pages_extracted}/{self.target_pages} list pages."
+        )
+        log_dir = Path("log")
+        log_dir.mkdir(exist_ok=True)
+        safe_session = re.sub(r"[^a-zA-Z0-9_.-]+", "_", self.executor.session)
+        stamp = int(time.time())
+        output_file = str(log_dir / f"detail_batch_output_{safe_session}_{stamp}.json")
+        progress_file = str(log_dir / f"detail_batch_progress_{safe_session}_{stamp}.jsonl")
+        command_timeout = self.executor._batch_command_timeout(len(self.list_items))
+        print(
+            f"[Agent] Detail batch files: output={output_file}, progress={progress_file}, "
+            f"command_timeout={command_timeout}s"
+        )
+        result = self.executor.batch_detail_extract(
+            self.list_items,
+            source_url=self._source_url(),
+            target_pages=self.target_pages,
+            list_pages_extracted=self.list_pages_extracted,
+            schema=["榜单名称", "榜单来源", "排名条目", "排名", "名称", "链接", "摘要", "更新时间"],
+            extractor="auto",
+            navigation_mode="click",
+            fallback_mode="direct",
+            wait_time=1.0,
+            wait_jitter=0.5,
+            max_retries=2,
+            item_timeout=DETAIL_BATCH_ITEM_TIMEOUT,
+            ai_timeout=DETAIL_BATCH_AI_TIMEOUT,
+            output_file=output_file,
+            progress_file=progress_file,
+            command_timeout=command_timeout,
+        )
+        self.detail_batch_ran = True
+        self._record_action(
+            "batch-detail-extract",
+            {
+                "items": len(self.list_items),
+                "output_file": output_file,
+                "progress_file": progress_file,
+                "command_timeout": command_timeout,
+            },
+            result,
+        )
+        self._record_result("batch-detail-extract", result)
+        self.history.append({
+            "skill": "batch-detail-extract",
+            "params": {
+                "items": len(self.list_items),
+                "output_file": output_file,
+                "progress_file": progress_file,
+                "command_timeout": command_timeout,
+            },
+            "result": result,
+        })
+        if result.get("ok"):
+            data = result.get("data") or {}
+            self._apply_detail_batch_data(data)
+            report.extracted_data = self._extracted_payload()
+            report.items_extracted = len(self.detail_items)
+            report.success = self._detail_crawler_success()
+            if not report.success:
+                report.error = "Detail batch ran but no detail pages were extracted successfully."
+        else:
+            partial_data = self._load_detail_batch_output(output_file)
+            if partial_data:
+                self._apply_detail_batch_data(partial_data)
+                result["partial_output_file"] = output_file
+                result["partial_items"] = len(self.detail_items)
+            report.extracted_data = self._extracted_payload()
+            report.items_extracted = len(self.detail_items or self.list_items)
+            report.error = f"Detail batch failed: {result.get('error')}"
+        return result
+
+    def _apply_detail_batch_data(self, data: dict[str, Any]) -> None:
+        self.detail_items = data.get("items", []) if isinstance(data.get("items"), list) else []
+        self.detail_pages_extracted = int(data.get("detail_pages_extracted") or 0)
+        self.detail_schema_learned = bool(data.get("detail_schema_learned"))
+        template = data.get("detail_template")
+        self.detail_template = template if isinstance(template, dict) else None
+
+    def _load_detail_batch_output(self, output_file: str) -> dict[str, Any] | None:
+        try:
+            path = Path(output_file)
+            if not path.exists():
+                return None
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def _find_next_page_ref(self, state: dict[str, Any]) -> str | None:
         tokens = (
@@ -827,17 +1224,19 @@ class DPCLIAgent:
         return None
 
     def _continuation_action_for_extraction(self, goal: str, state: dict[str, Any]) -> dict[str, Any] | None:
-        if not (self._goal_requests_extraction(goal) or self.collected_items or self.target_pages > 1):
+        if self._detail_crawler_ready_for_batch():
             return None
-        if self.extracted_pages >= self.target_pages:
+        if not (self._goal_requests_extraction(goal) or self.list_items or self.target_pages > 1):
+            return None
+        if self.list_pages_extracted >= self.target_pages:
             return None
         current_url = state.get("url")
-        if self.extracted_pages == 0 or current_url != self.last_extracted_page_url:
+        if self.list_pages_extracted == 0 or current_url != self.last_extracted_page_url:
             region_ref = self._best_data_region_ref(state)
             if region_ref:
                 return {
                     "skill": "extract",
-                    "params": {"target_ref": region_ref, "schema": ["title", "url"]},
+                    "params": {"target_ref": region_ref},
                     "reason": "Continue crawler goal by extracting the detected data region.",
                 }
         next_ref = self._find_next_page_ref(state)
@@ -937,6 +1336,7 @@ class DPCLIAgent:
         report = AgentReport(scenario="", goal=goal)
         start_time = time.time()
         self.target_pages = self._target_page_count(goal)
+        self.is_detail_crawler = self._goal_requests_detail_crawl(goal)
 
         try:
             # Step 0: Plan
@@ -944,7 +1344,7 @@ class DPCLIAgent:
             if plan.get("error"):
                 report.error = f"Plan error: {plan['error']}"
                 return report
-            report.scenario = plan.get("task_type", "unknown")
+            report.scenario = "detail_crawler" if self.is_detail_crawler else plan.get("task_type", "unknown")
             url = plan.get("url")
             if not url:
                 report.error = "No URL found in goal"
@@ -1001,9 +1401,25 @@ class DPCLIAgent:
                     report.error = error_msg
                     break
 
+                forced_detail_action = self._detail_list_collection_action(state)
+                if forced_detail_action:
+                    action = forced_detail_action
+                    print(f"[Agent] Override detail list collection: {action.get('reason')}")
+
                 skill = action.get("skill", "stop")
 
                 if skill == "stop":
+                    if self._detail_crawler_ready_for_batch():
+                        batch_result = self._run_detail_batch(report)
+                        agent_step = AgentStep(
+                            step=step,
+                            thought=decision.get("thought", ""),
+                            action={"skill": "batch-detail-extract", "params": {"items": len(self.list_items)}, "reason": "Run deterministic detail batch before stopping."},
+                            result=batch_result,
+                            duration_ms=(time.time() - step_start) * 1000,
+                        )
+                        report.steps.append(agent_step)
+                        break
                     continuation = self._continuation_action_for_extraction(goal, state)
                     if continuation:
                         action = continuation
@@ -1112,14 +1528,25 @@ class DPCLIAgent:
                     data = result.get("data") or {}
                     items = data.get("items", []) if isinstance(data, dict) else []
                     added = self._remember_extracted_items(data, state.get("url"))
-                    report.items_extracted = len(self.collected_items)
+                    report.items_extracted = len(self.list_items)
                     report.extracted_data = self._extracted_payload()
                     if items:
                         print(
-                            f"[Agent] Extracted page {self.extracted_pages}/{self.target_pages}, "
-                            f"added {added} new items (total: {len(self.collected_items)})"
+                            f"[Agent] Extracted list page {self.list_pages_extracted}/{self.target_pages}, "
+                            f"added {added} new items (total: {len(self.list_items)})"
                         )
-                    if items and self.extracted_pages >= self.target_pages:
+                    if items and self._detail_crawler_ready_for_batch():
+                        batch_result = self._run_detail_batch(report)
+                        agent_step = AgentStep(
+                            step=step,
+                            thought="Run deterministic detail extraction after list collection.",
+                            action={"skill": "batch-detail-extract", "params": {"items": len(self.list_items)}, "reason": "Detail crawler list phase is complete."},
+                            result=batch_result,
+                            duration_ms=0,
+                        )
+                        report.steps.append(agent_step)
+                        break
+                    if items and not self.is_detail_crawler and self.list_pages_extracted >= self.target_pages:
                         report.success = True
                         break
 
@@ -1128,18 +1555,26 @@ class DPCLIAgent:
                     js_result = data.get("result")
                     if isinstance(js_result, list) and js_result:
                         new_items = [item for item in js_result if isinstance(item, dict)]
-                        self.collected_items.extend(new_items)
-                        report.items_extracted = len(self.collected_items)
-                        print(f"[Agent] Collected {len(new_items)} items (total: {len(self.collected_items)})")
+                        for item in new_items:
+                            normalized = self._normalize_list_item(item)
+                            key = self._item_key(normalized)
+                            if key not in self.extracted_keys:
+                                self.extracted_keys.add(key)
+                                self.list_items.append(normalized)
+                        self._refresh_detail_urls()
+                        report.items_extracted = len(self.list_items)
+                        print(f"[Agent] Collected {len(new_items)} eval items (total: {len(self.list_items)})")
 
                 if skill == "click" and result.get("ok"):
                     pass
 
             else:
-                if self.collected_items:
-                    report.success = self.extracted_pages >= self.target_pages
+                if self.list_items:
+                    if self._detail_crawler_ready_for_batch():
+                        self._run_detail_batch(report)
+                    report.success = self._detail_crawler_success()
                     if not report.success:
-                        report.error = f"Max steps reached after extracting {self.extracted_pages}/{self.target_pages} pages"
+                        report.error = f"Max steps reached after list extraction {self.list_pages_extracted}/{self.target_pages}; detail batch ran={self.detail_batch_ran}"
                 else:
                     report.error = "Max steps reached"
 
@@ -1148,10 +1583,10 @@ class DPCLIAgent:
             import traceback
             traceback.print_exc()
 
-        if self.collected_items:
+        if self.list_items or self.detail_items:
             report.extracted_data = self._extracted_payload()
-            report.items_extracted = len(self.collected_items)
-            if self.extracted_pages >= self.target_pages:
+            report.items_extracted = len(self.detail_items or self.list_items)
+            if self._detail_crawler_success():
                 report.success = True
 
         report.total_duration_ms = (time.time() - start_time) * 1000
@@ -1590,7 +2025,141 @@ def test_is_duplicate_action():
     assert agent._is_duplicate_action("type", {"ref": "e12", "text": "hello"}) is True
     print("  PASSED: type after snapshot is still duplicate")
 
+
+def test_rank_goal_is_detail_crawler_and_forces_list_extraction():
+    agent = DPCLIAgent(llm=None, executor=None)
+    goal = "去这个网站，http://guozhivip.com/rank/，爬取主页栏目中各个榜单的详细信息，注意要点击进去"
+    agent.is_detail_crawler = agent._goal_requests_detail_crawl(goal)
+
+    state = {
+        "url": "http://guozhivip.com/rank/",
+        "data_regions": [
+            {"ref": "r1", "item_count": 12, "score": 120},
+            {"ref": "r2", "item_count": 48, "score": 480},
+        ],
+    }
+    action = agent._detail_list_collection_action(state)
+
+    assert agent.is_detail_crawler is True
+    assert action["skill"] == "extract"
+    assert action["params"] == {"target_ref": "r2"}
+
+
+def test_extract_projector_does_not_keep_only_detail_links_when_region_has_generic_rank_links():
+    from dp_cli.projector import ExtractProjector
+
+    nodes = [
+        {
+            "ref": "e1",
+            "ref_type": "element",
+            "role": "link",
+            "tag": "a",
+            "text": "微博热搜",
+            "name": "微博热搜",
+            "href": "/rank/weibo.html",
+            "url": "http://guozhivip.com/rank/",
+        },
+        {
+            "ref": "e2",
+            "ref_type": "element",
+            "role": "link",
+            "tag": "a",
+            "text": "胡润百富榜",
+            "name": "胡润百富榜",
+            "href": "https://www.hurun.net/zh-CN/Rank/HsRankDetails?pagetype=rich",
+            "url": "http://guozhivip.com/rank/",
+        },
+        {
+            "ref": "e3",
+            "ref_type": "element",
+            "role": "link",
+            "tag": "a",
+            "text": "知乎热榜",
+            "name": "知乎热榜",
+            "href": "/rank/zhihu.html",
+            "url": "http://guozhivip.com/rank/",
+        },
+    ]
+
+    result = ExtractProjector().project(
+        {"representative_ref": "r1", "item_refs": [node["ref"] for node in nodes]},
+        nodes,
+    )
+
+    assert result["item_count"] == 3
+    assert [item["title"] for item in result["items"]] == ["微博热搜", "胡润百富榜", "知乎热榜"]
+
     print("All _is_duplicate_action tests passed!")
+
+
+def test_batch_detail_executor_uses_scaled_timeout_and_progress_args():
+    class RecordingExecutor(DPCLIExecutor):
+        def __init__(self):
+            super().__init__(session="unit-test", headless=True)
+            self.recorded_args = ()
+            self.recorded_timeout = None
+
+        def _run(self, *args, command_timeout: float | int | None = None) -> dict[str, Any]:
+            self.recorded_args = args
+            self.recorded_timeout = command_timeout
+            return {"ok": True, "data": {"items": []}}
+
+    executor = RecordingExecutor()
+    items = [{"url": f"https://example.test/{index}"} for index in range(108)]
+    result = executor.batch_detail_extract(
+        items,
+        item_timeout=120,
+        ai_timeout=45,
+        output_file="log/out.json",
+        progress_file="log/progress.jsonl",
+    )
+
+    assert result["ok"] is True
+    assert executor.recorded_timeout == 108 * DETAIL_BATCH_PER_ITEM_TIMEOUT
+    assert "--item-timeout" in executor.recorded_args
+    assert "--ai-timeout" in executor.recorded_args
+    assert "--output-file" in executor.recorded_args
+    assert "--progress-file" in executor.recorded_args
+    assert executor.recorded_args[executor.recorded_args.index("--item-timeout") + 1] == "120"
+    assert executor.recorded_args[executor.recorded_args.index("--ai-timeout") + 1] == "45"
+
+
+def test_detail_batch_failure_loads_partial_output(tmp_path):
+    from unittest.mock import MagicMock
+
+    class FailingExecutor(DPCLIExecutor):
+        def __init__(self, output_payload: dict[str, Any]):
+            super().__init__(session="unit-test", headless=True)
+            self.output_payload = output_payload
+
+        def _batch_command_timeout(self, item_count: int) -> int:
+            return 600
+
+        def batch_detail_extract(self, items, **kwargs):
+            output_file = Path(kwargs["output_file"])
+            output_file.write_text(json.dumps(self.output_payload, ensure_ascii=False), encoding="utf-8")
+            return {"ok": False, "error": "Timeout after 600s"}
+
+    partial = {
+        "items": [
+            {"title": "One", "url": "https://example.test/one", "detail_ok": True, "detail_info": {"name": "One"}}
+        ],
+        "detail_pages_extracted": 1,
+        "detail_schema_learned": True,
+        "detail_template": {"extract_strategy": "partial"},
+    }
+    agent = DPCLIAgent(llm=MagicMock(), executor=FailingExecutor(partial))
+    agent.is_detail_crawler = True
+    agent.list_items = [{"title": "One", "url": "https://example.test/one"}]
+    agent._refresh_detail_urls()
+    report = AgentReport(scenario="unit", goal="detail")
+
+    result = agent._run_detail_batch(report)
+
+    assert result["ok"] is False
+    assert result["partial_items"] == 1
+    assert report.items_extracted == 1
+    assert report.extracted_data["items"][0]["detail_info"] == {"name": "One"}
 
 
 if __name__ == "__main__":

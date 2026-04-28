@@ -47,6 +47,16 @@ class SessionManager:
             return False
 
     def _restore_tab(self, browser, state: SessionState):
+        # DrissionPage documents latest_tab as the last activated tab. For agent
+        # commands this is a better default than a persisted tab id after a click
+        # opens a new tab or the user switches tabs manually.
+        try:
+            tab = browser.latest_tab
+            if self._tab_is_usable(tab):
+                return tab
+        except Exception:
+            pass
+
         saved_tab_id = state.last_tab_id
         if saved_tab_id and saved_tab_id in set(getattr(browser, "tab_ids", [])):
             try:
@@ -55,15 +65,6 @@ class SessionManager:
                     return tab
             except Exception:
                 pass
-
-        # Prefer tabs that the live browser currently exposes instead of trusting
-        # a persisted tab id from a previous browser lifecycle.
-        try:
-            tab = browser.latest_tab
-            if self._tab_is_usable(tab):
-                return tab
-        except Exception:
-            pass
 
         for tab_id in reversed(list(getattr(browser, "tab_ids", []))):
             try:
@@ -92,6 +93,6 @@ class SessionManager:
             raise last_error  # type: ignore[misc]
         ctx = RuntimeContext(self, meta, state, browser, tab)
         ctx.sync_runtime_identity()
-        ctx.sync_page_identity()
+        ctx.refresh_active_tab()
         ctx.persist()
         return ctx

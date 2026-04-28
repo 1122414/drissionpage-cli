@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import random
 import re
+import sys
+import time
+from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import urljoin
 
 from dp_cli.adapter import DrissionPageAdapter
+from dp_cli.ai_extractor import AiDetailExtractor
 from dp_cli.compressor import CompressedGroup, CompressionConfig, DOMCompressor
 from dp_cli.errors import (
     ElementNotFoundError,
@@ -56,10 +62,17 @@ class CliService:
         self.sessions = sessions or SessionManager()
         self.adapter = adapter or DrissionPageAdapter()
 
-    def open_page(self, url: str, session: str = DEFAULT_SESSION, headless: bool | None = None) -> dict:
+    def open_page(
+        self,
+        url: str,
+        session: str = DEFAULT_SESSION,
+        headless: bool | None = None,
+        wait_time: float = 0.0,
+    ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
             page = self.adapter.open_url(runtime.tab, url)
             runtime.sync_page_identity()
+            self._wait(wait_time)
             runtime.persist()
             return {"page": page}
 
@@ -71,6 +84,7 @@ class CliService:
         headless: bool | None = None,
         view: str | None = None,
         mode: str = "agent_summary",
+        wait_time: float = 0.0,
     ) -> dict:
         if view is not None:
             mode = "full" if view == "full" else "agent_summary"
@@ -81,6 +95,7 @@ class CliService:
         scope = "subtree" if ref else "page"
 
         with self._with_runtime(session=session, headless=headless) as runtime:
+            self._wait(wait_time)
             runtime.begin_snapshot()
             root_ref = ref
             root_xpath = None
@@ -137,10 +152,12 @@ class CliService:
         locator: str | None = None,
         text: str | None = None,
         headless: bool | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         if not locator and not text:
             raise InvalidInputError("find requires either --locator or --text.")
         with self._with_runtime(session=session, headless=headless) as runtime:
+            self._wait(wait_time)
             runtime.begin_snapshot()
             if locator:
                 records = self.adapter.find_by_locator(runtime.tab, locator)
@@ -163,6 +180,7 @@ class CliService:
         ref: str | None = None,
         locator: str | None = None,
         headless: bool | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         return self._perform_element_action(
             session=session,
@@ -171,6 +189,7 @@ class CliService:
             locator=locator,
             element_error_message="Could not find element to click.",
             action=lambda element, _text: self.adapter.click(element),
+            wait_time=wait_time,
             include_payload=lambda runtime, target_locator, state: {
                 "page": self._page_payload(runtime),
                 "target": self._target_payload(ref, target_locator),
@@ -185,6 +204,7 @@ class CliService:
         ref: str | None = None,
         locator: str | None = None,
         headless: bool | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         return self._perform_element_action(
             session=session,
@@ -194,6 +214,7 @@ class CliService:
             text=text,
             element_error_message="Could not find element to type into.",
             action=lambda element, value: self.adapter.type_text(element, value or ""),
+            wait_time=wait_time,
             include_payload=lambda runtime, target_locator, state: {
                 "page": self._page_payload(runtime),
                 "target": self._target_payload(ref, target_locator),
@@ -208,8 +229,10 @@ class CliService:
         ref: str | None = None,
         depth: int = 2,
         headless: bool | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
+            self._wait(wait_time)
             runtime.begin_snapshot()
             records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=self._ref_item(runtime, ref)["xpath"], depth=depth)
             nodes = runtime.upsert_nodes(records)
@@ -229,8 +252,10 @@ class CliService:
         group_ref: str | None = None,
         sample_size: int = 3,
         headless: bool | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
+            self._wait(wait_time)
             runtime.begin_snapshot()
             group_item = self._ref_item(runtime, group_ref)
             records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=group_item["xpath"], depth=2)
@@ -267,8 +292,10 @@ class CliService:
         schema: list[str] | None = None,
         limit: int | None = None,
         headless: bool | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
+            self._wait(wait_time)
             runtime.begin_snapshot()
             target_item = self._ref_item(runtime, target_ref)
             records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=target_item["xpath"], depth=6)
@@ -301,8 +328,10 @@ class CliService:
         session: str = DEFAULT_SESSION,
         ref: str | None = None,
         headless: bool | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
+            self._wait(wait_time)
             item = self._ref_item(runtime, ref)
             return {
                 "ref": ref,
@@ -317,13 +346,239 @@ class CliService:
         session: str = DEFAULT_SESSION,
         js: str = "",
         headless: bool | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
+            self._wait(wait_time)
             result = runtime.tab.run_js(js, as_expr=True)
             return {"result": result}
 
-    def inspect_session(self, session: str = DEFAULT_SESSION, headless: bool | None = None) -> dict:
+    def batch_extract_detail_pages(
+        self,
+        items: list[dict],
+        session: str = DEFAULT_SESSION,
+        source_url: str | None = None,
+        target_pages: int | None = None,
+        list_pages_extracted: int | None = None,
+        limit: int | None = None,
+        schema: list[str] | None = None,
+        extractor: str = "ai",
+        navigation_mode: str = "click",
+        fallback_mode: str = "direct",
+        wait_time: float = 0.0,
+        wait_jitter: float = 0.0,
+        max_retries: int = 1,
+        item_timeout: float | None = None,
+        ai_timeout: float | None = None,
+        output_file: str | None = None,
+        progress_file: str | None = None,
+        headless: bool | None = None,
+    ) -> dict:
+        if not isinstance(items, list):
+            raise InvalidInputError("batch-detail-extract requires a list of item objects.")
+        if extractor not in {"ai", "legacy-js", "auto"}:
+            raise InvalidInputError("batch-detail-extract --extractor must be one of: ai, legacy-js, auto.")
+        if navigation_mode not in {"click", "direct"}:
+            raise InvalidInputError("batch-detail-extract --navigation-mode must be one of: click, direct.")
+        if fallback_mode not in {"direct", "skip"}:
+            raise InvalidInputError("batch-detail-extract --fallback-mode must be one of: direct, skip.")
+
+        list_items = [item for item in items if isinstance(item, dict)]
+        if limit is not None and limit > 0:
+            list_items = list_items[:limit]
+
+        source = source_url or ""
+        detail_items = []
+        detail_pages_extracted = 0
+        detail_template = None
+        max_attempts = max(1, int(max_retries or 1))
+        item_timeout_value = self._positive_float(item_timeout)
+        ai_timeout_value = self._positive_float(ai_timeout)
+        output_path = self._prepare_batch_path(output_file)
+        progress_path = self._prepare_batch_path(progress_file)
+        if progress_path:
+            progress_path.write_text("", encoding="utf-8")
+
+        def current_payload(partial: bool) -> dict:
+            return self._batch_detail_payload(
+                source_url=source_url,
+                target_pages=target_pages,
+                list_pages_extracted=list_pages_extracted,
+                detail_pages_extracted=detail_pages_extracted,
+                detail_template=detail_template,
+                schema=schema,
+                extractor=extractor,
+                navigation_mode=navigation_mode,
+                fallback_mode=fallback_mode,
+                wait_time=wait_time,
+                wait_jitter=wait_jitter,
+                max_attempts=max_attempts,
+                item_timeout=item_timeout_value,
+                ai_timeout=ai_timeout_value,
+                output_file=str(output_path) if output_path else None,
+                progress_file=str(progress_path) if progress_path else None,
+                detail_items=detail_items,
+                partial=partial,
+            )
+
+        self._write_batch_output(output_path, current_payload(partial=True))
+
         with self._with_runtime(session=session, headless=headless) as runtime:
+            for index, list_item in enumerate(list_items, start=1):
+                item_started_at = time.monotonic()
+                detail_url = self._detail_item_url(list_item, source)
+                merged = {
+                    "title": list_item.get("title") or list_item.get("name"),
+                    "url": detail_url,
+                    "list_info": dict(list_item),
+                    "detail_info": {},
+                    "detail_ok": False,
+                    "detail_error": None,
+                    "extractor": extractor,
+                    "navigation_mode": navigation_mode,
+                }
+                if not detail_url:
+                    merged["detail_error"] = "Missing detail URL."
+                    detail_items.append(merged)
+                    self._persist_batch_item(
+                        output_path=output_path,
+                        progress_path=progress_path,
+                        payload=current_payload(partial=True),
+                        index=index,
+                        total=len(list_items),
+                        item=merged,
+                    )
+                    continue
+
+                errors = []
+                for attempt in range(max_attempts):
+                    if self._item_timed_out(item_started_at, item_timeout_value):
+                        errors.append(f"Item timeout after {item_timeout_value:.1f}s.")
+                        break
+                    try:
+                        if navigation_mode == "click":
+                            self._open_detail_by_click_or_fallback(
+                                runtime=runtime,
+                                list_item=list_item,
+                                detail_url=detail_url,
+                                source_url=source,
+                                fallback_mode=fallback_mode,
+                                wait_time=wait_time,
+                                item_started_at=item_started_at,
+                                item_timeout=item_timeout_value,
+                            )
+                        else:
+                            self._open_url(
+                                runtime.tab,
+                                detail_url,
+                                timeout=self._remaining_item_timeout(item_started_at, item_timeout_value),
+                            )
+                            runtime.sync_page_identity()
+                            self._wait(wait_time)
+                        if self._item_timed_out(item_started_at, item_timeout_value):
+                            raise TimeoutError(f"Item timeout after {item_timeout_value:.1f}s before extraction.")
+                        extracted = self._extract_detail(
+                            runtime.tab,
+                            extractor=extractor,
+                            schema=schema,
+                            ai_timeout=ai_timeout_value,
+                        )
+                        detail_info = extracted.get("detail_info") if isinstance(extracted, dict) else {}
+                        if not isinstance(detail_info, dict):
+                            detail_info = {}
+                        if detail_info:
+                            merged["detail_info"] = detail_info
+                            merged["detail_ok"] = True
+                            merged["detail_error"] = None
+                            merged["fields"] = extracted.get("fields", list(detail_info.keys()))
+                            merged["confidence"] = extracted.get("confidence")
+                            merged["warnings"] = extracted.get("warnings", [])
+                            detail_pages_extracted += 1
+                            if detail_template is None:
+                                detail_template = extracted.get("template") if isinstance(extracted, dict) else None
+                            break
+                        errors.append("No detail fields extracted.")
+                    except Exception as exc:  # keep batch crawling resilient per item
+                        errors.append(str(exc))
+                    if self._item_timed_out(item_started_at, item_timeout_value):
+                        errors.append(f"Item timeout after {item_timeout_value:.1f}s.")
+                        break
+                    if attempt < max_attempts - 1:
+                        self._wait(self._retry_wait(wait_time, wait_jitter, attempt))
+                if not merged["detail_ok"]:
+                    merged["detail_error"] = "; ".join(error for error in errors if error) or "Detail extraction failed."
+                detail_items.append(merged)
+                self._persist_batch_item(
+                    output_path=output_path,
+                    progress_path=progress_path,
+                    payload=current_payload(partial=True),
+                    index=index,
+                    total=len(list_items),
+                    item=merged,
+                )
+                runtime.persist()
+                self._wait(self._item_wait(wait_time, wait_jitter))
+
+            runtime.persist()
+
+        final_payload = current_payload(partial=False)
+        self._write_batch_output(output_path, final_payload)
+        return final_payload
+
+    def _batch_detail_payload(
+        self,
+        *,
+        source_url: str | None,
+        target_pages: int | None,
+        list_pages_extracted: int | None,
+        detail_pages_extracted: int,
+        detail_template: dict | None,
+        schema: list[str] | None,
+        extractor: str,
+        navigation_mode: str,
+        fallback_mode: str,
+        wait_time: float,
+        wait_jitter: float,
+        max_attempts: int,
+        item_timeout: float | None,
+        ai_timeout: float | None,
+        output_file: str | None,
+        progress_file: str | None,
+        detail_items: list[dict],
+        partial: bool,
+    ) -> dict:
+        return {
+            "task_type": "detail_crawler",
+            "source_url": source_url,
+            "target_pages": target_pages,
+            "list_pages_extracted": list_pages_extracted,
+            "detail_pages_extracted": detail_pages_extracted,
+            "detail_schema_learned": detail_template is not None,
+            "detail_template": detail_template,
+            "schema": schema,
+            "extractor": extractor,
+            "navigation_mode": navigation_mode,
+            "fallback_mode": fallback_mode,
+            "wait_time": wait_time,
+            "wait_jitter": wait_jitter,
+            "max_retries": max_attempts,
+            "item_timeout": item_timeout,
+            "ai_timeout": ai_timeout,
+            "output_file": output_file,
+            "progress_file": progress_file,
+            "partial": partial,
+            "item_count": len(detail_items),
+            "items": list(detail_items),
+        }
+
+    def inspect_session(
+        self,
+        session: str = DEFAULT_SESSION,
+        headless: bool | None = None,
+        wait_time: float = 0.0,
+    ) -> dict:
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            self._wait(wait_time)
             return {
                 "session_name": runtime.meta.session,
                 "session_id": runtime.meta.session_id,
@@ -353,6 +608,7 @@ class CliService:
     @contextmanager
     def _with_runtime(self, session: str, headless: bool | None):
         with self.sessions.open_runtime(session=session, headless=headless) as runtime:
+            runtime.refresh_active_tab()
             yield runtime
 
     def _page_payload(self, runtime) -> dict:
@@ -432,6 +688,7 @@ class CliService:
         action: Callable,
         include_payload: Callable,
         text: str | None = None,
+        wait_time: float = 0.0,
     ) -> dict:
         with self._with_runtime(session=session, headless=headless) as runtime:
             target_locator = self._resolve_target(runtime, ref, locator)
@@ -439,14 +696,234 @@ class CliService:
             if not element:
                 raise ElementNotFoundError(element_error_message, {"locator": target_locator})
             state = self._ensure_element_interactable(element, target_locator)
+            before_tab_ids = set(getattr(runtime.browser, "tab_ids", []) or [])
             action(element, text)
-            try:
-                state = self.adapter.element_state(element)
-            except Exception:
+            tab_transition = runtime.refresh_after_possible_tab_change(before_tab_ids)
+            self._wait(wait_time)
+            if tab_transition.get("opened_new_tab") or tab_transition.get("active_tab_changed"):
                 state = {**state, "state_after_action_unavailable": True}
-            runtime.sync_page_identity()
+            else:
+                try:
+                    state = self.adapter.element_state(element)
+                except Exception:
+                    state = {**state, "state_after_action_unavailable": True}
             runtime.persist()
-            return include_payload(runtime, target_locator, state)
+            payload = include_payload(runtime, target_locator, state)
+            payload["page_identity"] = self._page_identity_payload(runtime)
+            payload["tab_transition"] = tab_transition
+            return payload
+
+    def _extract_detail(
+        self,
+        tab,
+        extractor: str,
+        schema: list[str] | None = None,
+        ai_timeout: float | None = None,
+    ) -> dict:
+        if extractor == "legacy-js":
+            return self.adapter.extract_detail(tab)
+        if extractor == "ai":
+            ai = AiDetailExtractor(timeout=ai_timeout) if ai_timeout else AiDetailExtractor()
+            return ai.extract(self.adapter.detail_page_package(tab), schema=schema)
+        try:
+            ai = AiDetailExtractor(timeout=ai_timeout) if ai_timeout else AiDetailExtractor()
+            return ai.extract(self.adapter.detail_page_package(tab), schema=schema)
+        except Exception as exc:
+            legacy = self.adapter.extract_detail(tab)
+            warnings = legacy.get("warnings") if isinstance(legacy, dict) else None
+            if not isinstance(warnings, list):
+                warnings = []
+            warnings.append(f"AI extractor failed; legacy-js fallback used: {exc}")
+            if isinstance(legacy, dict):
+                legacy["warnings"] = warnings
+            return legacy
+
+    def _open_detail_by_click_or_fallback(
+        self,
+        runtime,
+        list_item: dict,
+        detail_url: str,
+        source_url: str,
+        fallback_mode: str,
+        wait_time: float,
+        item_started_at: float,
+        item_timeout: float | None,
+    ) -> None:
+        try:
+            self._open_detail_by_click(
+                runtime,
+                list_item,
+                detail_url,
+                source_url,
+                wait_time,
+                item_started_at,
+                item_timeout,
+            )
+            return
+        except Exception:
+            if fallback_mode == "skip":
+                raise
+        self._open_url(
+            runtime.tab,
+            detail_url,
+            timeout=self._remaining_item_timeout(item_started_at, item_timeout),
+        )
+        runtime.sync_page_identity()
+        self._wait(wait_time)
+
+    def _open_detail_by_click(
+        self,
+        runtime,
+        list_item: dict,
+        detail_url: str,
+        source_url: str,
+        wait_time: float,
+        item_started_at: float,
+        item_timeout: float | None,
+    ) -> None:
+        source_page_url = list_item.get("source_page_url") or list_item.get("page_url") or source_url
+        if source_page_url and runtime.state.active_page.url != source_page_url:
+            self._open_url(
+                runtime.tab,
+                source_page_url,
+                timeout=self._remaining_item_timeout(item_started_at, item_timeout),
+            )
+            runtime.sync_page_identity()
+            self._wait(wait_time)
+
+        locator = None
+        item_ref = list_item.get("item_ref") or list_item.get("ref")
+        if item_ref:
+            try:
+                locator = self._ref_item(runtime, str(item_ref))["locator"]
+            except Exception:
+                locator = None
+        if not locator:
+            locator = self._find_detail_link_locator(runtime, list_item, detail_url)
+        if not locator:
+            raise ElementNotFoundError("Could not find detail link to click.", {"url": detail_url})
+
+        element = self.adapter.resolve(runtime.tab, locator)
+        if not element:
+            raise ElementNotFoundError("Could not resolve detail link to click.", {"locator": locator})
+        self._ensure_element_interactable(element, locator)
+        before_tab_ids = set(getattr(runtime.browser, "tab_ids", []) or [])
+        self.adapter.click(element)
+        runtime.refresh_after_possible_tab_change(before_tab_ids)
+        runtime.sync_page_identity()
+        self._wait(wait_time)
+
+    def _find_detail_link_locator(self, runtime, list_item: dict, detail_url: str) -> str | None:
+        runtime.begin_snapshot()
+        nodes = runtime.upsert_nodes(self.adapter.snapshot_nodes(runtime.tab, depth=None))
+        detail_abs = self._absolute_url(detail_url, runtime.state.active_page.url or "")
+        text = str(list_item.get("text") or list_item.get("title") or list_item.get("name") or "").strip()
+        best: tuple[int, str] | None = None
+        for node in nodes:
+            if node.get("ref_type") != "element" or node.get("role") != "link":
+                continue
+            href = node.get("href") or ""
+            node_abs = self._absolute_url(href, node.get("url") or runtime.state.active_page.url or "")
+            node_text = str(node.get("text") or node.get("name") or "").strip()
+            score = 0
+            if detail_abs and node_abs == detail_abs:
+                score += 100
+            if text and (text == node_text or text in node_text or node_text in text):
+                score += 40
+            if score <= 0:
+                continue
+            locator = node.get("locator")
+            if locator and (best is None or score > best[0]):
+                best = (score, locator)
+        runtime.persist()
+        return best[1] if best else None
+
+    def _absolute_url(self, url: str, base_url: str = "") -> str:
+        if not isinstance(url, str):
+            return ""
+        return urljoin(base_url or "", url.strip())
+
+    def _item_wait(self, wait_time: float, wait_jitter: float) -> float:
+        base = max(0.0, float(wait_time or 0.0))
+        jitter = max(0.0, float(wait_jitter or 0.0))
+        return base + (random.uniform(0, jitter) if jitter else 0.0)
+
+    def _retry_wait(self, wait_time: float, wait_jitter: float, attempt: int) -> float:
+        return self._item_wait(wait_time, wait_jitter) * max(1, attempt + 1)
+
+    def _positive_float(self, value: float | int | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _item_timed_out(self, started_at: float, item_timeout: float | None) -> bool:
+        return bool(item_timeout and time.monotonic() - started_at >= item_timeout)
+
+    def _remaining_item_timeout(self, started_at: float, item_timeout: float | None) -> float | None:
+        if not item_timeout:
+            return None
+        remaining = item_timeout - (time.monotonic() - started_at)
+        return max(0.1, remaining)
+
+    def _open_url(self, tab, url: str, timeout: float | None = None) -> dict:
+        try:
+            return self.adapter.open_url(tab, url, timeout=timeout)
+        except TypeError:
+            return self.adapter.open_url(tab, url)
+
+    def _prepare_batch_path(self, path: str | None) -> Path | None:
+        if not path:
+            return None
+        prepared = Path(path)
+        prepared.parent.mkdir(parents=True, exist_ok=True)
+        return prepared
+
+    def _write_batch_output(self, path: Path | None, payload: dict) -> None:
+        if not path:
+            return
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _append_batch_progress(self, path: Path | None, entry: dict) -> None:
+        if not path:
+            return
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _persist_batch_item(
+        self,
+        *,
+        output_path: Path | None,
+        progress_path: Path | None,
+        payload: dict,
+        index: int,
+        total: int,
+        item: dict,
+    ) -> None:
+        entry = {
+            "index": index,
+            "total": total,
+            "url": item.get("url"),
+            "title": item.get("title"),
+            "detail_ok": bool(item.get("detail_ok")),
+            "detail_info": item.get("detail_info") if isinstance(item.get("detail_info"), dict) else {},
+            "detail_error": item.get("detail_error"),
+        }
+        self._append_batch_progress(progress_path, entry)
+        self._write_batch_output(output_path, payload)
+        status = "ok" if entry["detail_ok"] else "failed"
+        print(f"[DetailBatch] {index}/{total} {status} {entry['url']}", file=sys.stderr, flush=True)
+
+    def _wait(self, seconds: float | int | None) -> None:
+        try:
+            value = float(seconds or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            time.sleep(value)
 
     def _write_snapshot_artifact(self, session: str, artifact: SnapshotArtifact, snapshot_id: str) -> str:
         snapshots_dir = self.sessions.store.base_dir / "snapshots" / session
@@ -639,7 +1116,14 @@ class CliService:
             [
                 n
                 for n in nodes
-                if n["ref_type"] == "element" and n["visibility"]["interactable_now"]
+                if n["ref_type"] == "element"
+                and (
+                    n["visibility"]["interactable_now"]
+                    or (
+                        n.get("role") in {"checkbox", "radio", "switch"}
+                        and n["visibility"].get("visible")
+                    )
+                )
                 and not self._is_redundant_action_parent(n, children)
             ],
             lookup,
@@ -670,28 +1154,32 @@ class CliService:
         return index
 
     def _detect_data_regions(self, nodes: list[dict]) -> list[dict]:
+        lookup = {node["ref"]: node for node in nodes if node.get("ref")}
+        children = self._children_map(nodes)
         containers = [node for node in nodes if node.get("ref_type") == "container" and node.get("xpath")]
-        item_links = [node for node in nodes if self._is_extractable_item_link(node)]
-        if not item_links:
-            return []
 
         candidates = []
         for container in containers:
-            xpath = container["xpath"]
-            descendant_links = [
-                link
-                for link in item_links
-                if link.get("xpath", "").startswith(xpath + "/")
-            ]
-            if len(descendant_links) < 3:
+            descendants = self._descendant_elements(container["ref"], children)
+            if not descendants:
+                xpath = container.get("xpath") or ""
+                descendants = [
+                    node
+                    for node in nodes
+                    if node.get("ref_type") == "element" and node.get("xpath", "").startswith(xpath + "/")
+                ]
+            if len(descendants) < 3:
                 continue
-            samples = [
-                {
-                    "text": link.get("text") or link.get("name"),
-                    "url": self._absolute_href(link),
-                }
-                for link in descendant_links[:3]
-            ]
+            link_nodes = [node for node in descendants if self._is_content_link(node)]
+            row_groups = self._row_groups(descendants)
+            repeated_count = max((len(group) for group in row_groups.values()), default=0)
+            item_count = max(len(link_nodes), repeated_count, len(row_groups))
+            if item_count < 3:
+                continue
+            kind = self._data_region_kind(container, descendants, link_nodes, row_groups)
+            score = self._data_region_score(container, descendants, link_nodes, row_groups, lookup)
+            if score <= 0:
+                continue
             candidates.append(
                 {
                     "ref": container["ref"],
@@ -699,8 +1187,11 @@ class CliService:
                     "tag": container.get("tag"),
                     "role": container.get("role"),
                     "name": container.get("name"),
-                    "item_count": len(descendant_links),
-                    "sample_items": samples,
+                    "kind": kind,
+                    "item_count": item_count,
+                    "sample_items": self._data_region_samples(descendants, link_nodes, row_groups),
+                    "score": score,
+                    "why": self._data_region_reason(kind, descendants, link_nodes, row_groups),
                     "_depth": container.get("depth", 0),
                     "_text_len": len(container.get("text") or ""),
                 }
@@ -709,14 +1200,12 @@ class CliService:
         if not candidates:
             return []
 
-        # Prefer the smallest deep container that still covers many detail links.
-        candidates.sort(key=lambda item: (-item["_depth"], item["_text_len"], -item["item_count"]))
+        # Prefer strong, specific repeated-content regions over broad page wrappers.
+        candidates.sort(key=lambda item: (-item["score"], -item["_depth"], item["_text_len"], -item["item_count"]))
         selected = []
-        seen_refs = set()
         for candidate in candidates:
-            if candidate["ref"] in seen_refs:
+            if self._is_covered_by_selected(candidate, selected, lookup):
                 continue
-            seen_refs.add(candidate["ref"])
             candidate = dict(candidate)
             candidate.pop("_depth", None)
             candidate.pop("_text_len", None)
@@ -726,6 +1215,7 @@ class CliService:
         return selected
 
     def _is_extractable_item_link(self, node: dict) -> bool:
+        return self._is_content_link(node)
         if node.get("ref_type") != "element" or node.get("role") != "link":
             return False
         href = (node.get("href") or "").lower()
@@ -740,9 +1230,137 @@ class CliService:
             return False
         return False
 
+    def _is_content_link(self, node: dict) -> bool:
+        if node.get("ref_type") != "element" or node.get("role") != "link" or not node.get("href"):
+            return False
+        href = (node.get("href") or "").lower()
+        text = (node.get("text") or node.get("name") or "").strip()
+        if len(text) < 2:
+            return False
+        if href in {"#", "/", "javascript:void(0)"}:
+            return False
+        normalized_text = self._normalized(text)
+        if normalized_text in PAGINATION_KEYWORDS or re.fullmatch(r"\d+", normalized_text):
+            return False
+        if any(token in href for token in ("login", "logout", "register", "search", "tag/", "category", "page=")):
+            return False
+        return True
+
+    def _row_groups(self, nodes: list[dict]) -> dict[str, list[dict]]:
+        groups: dict[str, list[dict]] = defaultdict(list)
+        for node in nodes:
+            xpath = node.get("xpath") or ""
+            parts = xpath.split("/")
+            indexed = [i for i, part in enumerate(parts) if re.search(r"\[\d+\]", part)]
+            if indexed:
+                key = "/".join(parts[: indexed[-1] + 1])
+            else:
+                key = node.get("parent_ref") or xpath
+            groups[key].append(node)
+        return {key: value for key, value in groups.items() if value}
+
+    def _data_region_kind(
+        self,
+        container: dict,
+        descendants: list[dict],
+        link_nodes: list[dict],
+        row_groups: dict[str, list[dict]],
+    ) -> str:
+        tag = (container.get("tag") or "").lower()
+        role = (container.get("role") or "").lower()
+        if tag == "table" or role in {"table", "grid"}:
+            return "table"
+        if role in {"list", "listbox"} or any((node.get("tag") or "").lower() == "li" for node in descendants):
+            return "list"
+        if len(link_nodes) >= 3 and len(row_groups) >= 3:
+            return "card_grid"
+        return "repeated_structure"
+
+    def _data_region_score(
+        self,
+        container: dict,
+        descendants: list[dict],
+        link_nodes: list[dict],
+        row_groups: dict[str, list[dict]],
+        lookup: dict[str, dict],
+    ) -> int:
+        score = min(len(descendants), 80)
+        score += min(len(link_nodes), 50) * 5
+        score += min(len(row_groups), 30) * 4
+        if len(link_nodes) >= 3:
+            score += 80
+        if len(row_groups) >= 3:
+            score += 60
+        role = (container.get("role") or "").lower()
+        tag = (container.get("tag") or "").lower()
+        if role in {"main", "region", "list", "table", "grid"} or tag in {"main", "section", "ul", "ol", "table"}:
+            score += 40
+        if role in {"navigation", "banner", "contentinfo", "form", "search"} or self._has_ancestor_role(container, lookup, {"navigation"}):
+            score -= 140
+        if len(container.get("text") or "") > 8000:
+            score -= 60
+        return score
+
+    def _data_region_samples(
+        self,
+        descendants: list[dict],
+        link_nodes: list[dict],
+        row_groups: dict[str, list[dict]],
+    ) -> list[dict]:
+        samples = []
+        preferred = link_nodes if len(link_nodes) >= 3 else [group[0] for group in row_groups.values() if group]
+        for node in preferred[:3]:
+            samples.append(
+                self._filter_empty_fields(
+                    {
+                        "ref": node.get("ref"),
+                        "text": node.get("text") or node.get("name"),
+                        "url": self._absolute_href(node) if node.get("href") else None,
+                    }
+                )
+            )
+        if samples:
+            return samples
+        return [
+            self._filter_empty_fields({"ref": node.get("ref"), "text": node.get("text") or node.get("name")})
+            for node in descendants[:3]
+        ]
+
+    def _data_region_reason(
+        self,
+        kind: str,
+        descendants: list[dict],
+        link_nodes: list[dict],
+        row_groups: dict[str, list[dict]],
+    ) -> str:
+        return (
+            f"{kind}: {len(descendants)} descendant elements, "
+            f"{len(link_nodes)} content links, {len(row_groups)} repeated row groups"
+        )
+
+    def _is_covered_by_selected(self, candidate: dict, selected: list[dict], lookup: dict[str, dict]) -> bool:
+        current_ref = candidate.get("ref")
+        ancestors = set()
+        while current_ref:
+            parent = lookup.get(current_ref, {}).get("parent_ref")
+            if not parent:
+                break
+            ancestors.add(parent)
+            current_ref = parent
+        for item in selected:
+            if item.get("ref") in ancestors and item.get("item_count", 0) >= candidate.get("item_count", 0):
+                return True
+        return False
+
     def _absolute_href(self, node: dict) -> str:
         href = node.get("href") or ""
         return urljoin(node.get("url") or "", href)
+
+    def _detail_item_url(self, item: dict, source_url: str = "") -> str:
+        raw_url = item.get("detail_url") or item.get("url") or item.get("href") or ""
+        if not isinstance(raw_url, str):
+            return ""
+        return urljoin(source_url or "", raw_url.strip())
 
     def _is_redundant_action_parent(self, node: dict, children: dict[str, list[dict]]) -> bool:
         if node.get("role") != "button" or node.get("tag") not in {"div", "span"}:

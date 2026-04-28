@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
+from dp_cli.cli import build_parser
 from dp_cli.projector import ExtractProjector
 from dp_cli.session import SessionManager
 from dp_cli.service import CliService
@@ -153,6 +155,36 @@ def test_open_recovers_from_stale_saved_tab_id(local_fixture_server, local_sessi
         reopened = run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
         assert reopened["ok"] is True
         assert reopened["data"]["page"]["title"] == "dp_cli Fixture"
+    finally:
+        cleanup_session(local_session)
+
+
+def test_click_target_blank_switches_runtime_to_new_tab(local_fixture_server, local_session):
+    try:
+        opened = run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        assert opened["ok"] is True
+
+        found = run_cli("find", "--session", local_session, "--headless", "--text", "Open detail in new tab")
+        link = select_node(found, ref_type="element", role="link", name_contains="Open detail")
+
+        clicked = run_cli("click", "--session", local_session, "--headless", "--ref", link["ref"])
+        assert clicked["ok"] is True
+        assert clicked["data"]["tab_transition"]["opened_new_tab"] is True
+        assert clicked["data"]["page"]["url"].endswith("/detail.html")
+
+        snapshot = run_cli("snapshot", "--session", local_session, "--headless")
+        assert snapshot["ok"] is True
+        assert snapshot["data"]["page"]["title"] == "Detail Fixture"
+        assert snapshot["data"]["page"]["url"].endswith("/detail.html")
+
+        found_detail = run_cli("find", "--session", local_session, "--headless", "--text", "New tab detail content")
+        assert found_detail["ok"] is True
+        assert found_detail["data"]["page"]["title"] == "Detail Fixture"
+        assert found_detail["data"]["count"] >= 1
+
+        evaluated = run_cli("eval", "document.title", "--session", local_session, "--headless")
+        assert evaluated["ok"] is True
+        assert evaluated["data"]["result"] == "Detail Fixture"
     finally:
         cleanup_session(local_session)
 
@@ -493,6 +525,51 @@ def test_snapshot_index_promotes_extractable_data_regions():
     assert index["surface_index"][0]["item_count"] == 4
 
 
+def test_snapshot_index_detects_generic_content_links_without_detail_tokens():
+    def container(ref: str, xpath: str, depth: int, role: str = "") -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "container",
+            "tag": "section",
+            "role": role,
+            "name": "Products",
+            "text": "Alpha Beta Gamma Delta",
+            "xpath": xpath,
+            "depth": depth,
+            "visibility": {"visible": True, "in_viewport": True, "interactable_now": False},
+            "states": {"disabled": False, "checked": False, "selected": False, "expanded": False},
+            "semantic_level": "surface",
+        }
+
+    def product_link(index: int) -> dict:
+        return {
+            "ref": f"e{index}",
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": f"Product {index}",
+            "text": f"Product {index}",
+            "href": f"/products/{index}",
+            "url": "https://example.test/catalog",
+            "xpath": f"/html/body/main/section/article[{index}]/a",
+            "visibility": {"visible": True, "in_viewport": True, "interactable_now": True},
+            "states": {"disabled": False, "checked": False, "selected": False, "expanded": False},
+            "semantic_level": "surface",
+        }
+
+    nodes = [
+        container("r1", "/html/body/nav", 1, role="navigation"),
+        container("r2", "/html/body/main/section", 3),
+        *[product_link(i) for i in range(1, 5)],
+    ]
+
+    index = CliService()._build_index(nodes)
+
+    assert index["data_regions"][0]["ref"] == "r2"
+    assert index["data_regions"][0]["kind"] in {"card_grid", "repeated_structure"}
+    assert index["data_regions"][0]["sample_items"][0]["url"] == "https://example.test/products/1"
+
+
 def test_extract_projector_outputs_relative_detail_links_with_schema():
     nodes = [
         {
@@ -519,6 +596,240 @@ def test_extract_projector_outputs_relative_detail_links_with_schema():
         "url": "https://example.test/vod-detail-id-1.html",
         "title": "Movie 1",
     }
+
+
+def test_extract_projector_keeps_click_navigation_metadata_without_schema():
+    nodes = [
+        {
+            "ref": "e1",
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": "Product One",
+            "text": "Product One",
+            "href": "/products/one",
+            "url": "https://example.test/catalog",
+        },
+        {
+            "ref": "e2",
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": "Product Two",
+            "text": "Product Two",
+            "href": "/products/two",
+            "url": "https://example.test/catalog",
+        },
+        {
+            "ref": "e3",
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": "Product Three",
+            "text": "Product Three",
+            "href": "/products/three",
+            "url": "https://example.test/catalog",
+        },
+    ]
+
+    result = ExtractProjector().project(
+        {"representative_ref": "r1", "item_refs": [node["ref"] for node in nodes]},
+        nodes,
+    )
+
+    assert result["items"][0]["detail_url"] == "https://example.test/products/one"
+    assert result["items"][0]["item_ref"] == "e1"
+    assert result["items"][0]["source_page_url"] == "https://example.test/catalog"
+
+
+def test_common_wait_time_argument_is_available_to_batch_detail_command():
+    args = build_parser().parse_args(
+        [
+            "batch-detail-extract",
+            "--items-json",
+            "[]",
+            "--wait-time",
+            "1.25",
+            "--wait-jitter",
+            "0.5",
+            "--max-retries",
+            "2",
+            "--schema",
+            "price",
+            "url",
+            "--extractor",
+            "auto",
+            "--navigation-mode",
+            "direct",
+            "--item-timeout",
+            "120",
+            "--ai-timeout",
+            "30",
+            "--output-file",
+            "log/out.json",
+            "--progress-file",
+            "log/progress.jsonl",
+        ]
+    )
+
+    assert args.wait_time == 1.25
+    assert args.wait_jitter == 0.5
+    assert args.max_retries == 2
+    assert args.schema == ["price", "url"]
+    assert args.extractor == "auto"
+    assert args.navigation_mode == "direct"
+    assert args.item_timeout == 120
+    assert args.ai_timeout == 30
+    assert args.output_file == "log/out.json"
+    assert args.progress_file == "log/progress.jsonl"
+
+
+def test_batch_detail_ai_extractor_uses_generic_page_package(monkeypatch):
+    class FakeAdapter:
+        def page_info(self, tab):
+            return {"url": tab.url, "title": "Detail"}
+
+        def open_url(self, tab, url):
+            tab.url = url
+            return self.page_info(tab)
+
+        def detail_page_package(self, tab):
+            return {"url": tab.url, "title": "Detail", "body_text": "Price: 12"}
+
+    class FakeTab:
+        url = "https://example.test/catalog"
+
+    class FakeRuntime:
+        def __init__(self):
+            self.tab = FakeTab()
+            self.state = type("State", (), {"active_page": type("Page", (), {"url": self.tab.url})()})()
+
+        def sync_page_identity(self):
+            self.state.active_page.url = self.tab.url
+
+        def persist(self):
+            pass
+
+    class FakeAiExtractor:
+        def extract(self, page_package, schema=None):
+            return {
+                "detail_info": {"price": "12"},
+                "fields": ["price"],
+                "confidence": 0.9,
+                "warnings": [],
+                "template": {"extract_strategy": "fake_ai"},
+            }
+
+    service = CliService(adapter=FakeAdapter())
+    runtime = FakeRuntime()
+
+    @contextmanager
+    def fake_runtime(*args, **kwargs):
+        yield runtime
+
+    monkeypatch.setattr(service, "_with_runtime", fake_runtime)
+    monkeypatch.setattr("dp_cli.service.AiDetailExtractor", FakeAiExtractor)
+
+    result = service.batch_extract_detail_pages(
+        [{"title": "One", "url": "https://example.test/item/one"}],
+        extractor="ai",
+        navigation_mode="direct",
+    )
+
+    assert result["items"][0]["detail_ok"] is True
+    assert result["items"][0]["detail_info"] == {"price": "12"}
+    assert result["detail_template"] == {"extract_strategy": "fake_ai"}
+
+
+def test_batch_detail_writes_incremental_output_and_progress(monkeypatch, tmp_path):
+    class FakeAdapter:
+        def page_info(self, tab):
+            return {"url": tab.url, "title": "Detail"}
+
+        def open_url(self, tab, url):
+            tab.url = url
+            return self.page_info(tab)
+
+        def detail_page_package(self, tab):
+            return {"url": tab.url, "title": "Detail", "body_text": f"Detail for {tab.url}"}
+
+    class FakeTab:
+        url = "https://example.test/catalog"
+
+    class FakeRuntime:
+        def __init__(self):
+            self.tab = FakeTab()
+            self.state = type("State", (), {"active_page": type("Page", (), {"url": self.tab.url})()})()
+
+        def sync_page_identity(self):
+            self.state.active_page.url = self.tab.url
+
+        def persist(self):
+            pass
+
+    class FakeAiExtractor:
+        def __init__(self, *args, **kwargs):
+            self.timeout = kwargs.get("timeout")
+
+        def extract(self, page_package, schema=None):
+            return {
+                "detail_info": {"url": page_package["url"], "schema": ",".join(schema or [])},
+                "fields": ["url", "schema"],
+                "confidence": 1,
+                "warnings": [],
+                "template": {"extract_strategy": "fake_ai"},
+            }
+
+    service = CliService(adapter=FakeAdapter())
+    runtime = FakeRuntime()
+
+    @contextmanager
+    def fake_runtime(*args, **kwargs):
+        yield runtime
+
+    monkeypatch.setattr(service, "_with_runtime", fake_runtime)
+    monkeypatch.setattr("dp_cli.service.AiDetailExtractor", FakeAiExtractor)
+
+    output_file = tmp_path / "detail-output.json"
+    progress_file = tmp_path / "detail-progress.jsonl"
+    result = service.batch_extract_detail_pages(
+        [
+            {"title": "One", "url": "https://example.test/item/one"},
+            {"title": "Missing"},
+            {"title": "Two", "url": "https://example.test/item/two"},
+        ],
+        extractor="ai",
+        navigation_mode="direct",
+        schema=["url"],
+        item_timeout=30,
+        ai_timeout=12,
+        output_file=str(output_file),
+        progress_file=str(progress_file),
+    )
+
+    assert result["partial"] is False
+    assert result["item_count"] == 3
+    assert result["detail_pages_extracted"] == 2
+    assert result["output_file"] == str(output_file)
+    assert result["progress_file"] == str(progress_file)
+    assert result["ai_timeout"] == 12
+    assert result["item_timeout"] == 30
+
+    saved = json.loads(output_file.read_text(encoding="utf-8"))
+    assert saved["partial"] is False
+    assert saved["item_count"] == 3
+    assert saved["items"][0]["detail_ok"] is True
+    assert saved["items"][1]["detail_error"] == "Missing detail URL."
+
+    progress_entries = [
+        json.loads(line)
+        for line in progress_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [entry["index"] for entry in progress_entries] == [1, 2, 3]
+    assert progress_entries[0]["total"] == 3
+    assert progress_entries[1]["detail_ok"] is False
+    assert progress_entries[2]["detail_info"]["url"].endswith("/two")
 
 
 def test_snapshot_index_prefers_leaf_text_button_over_wide_parent():

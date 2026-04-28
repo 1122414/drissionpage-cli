@@ -214,10 +214,7 @@ class ExtractProjector:
                 continue
             links.append(node)
 
-        item_links = [node for node in links if self._is_item_detail_link(node)]
-        if len(item_links) >= 2:
-            links = item_links
-        elif len(links) < 3:
+        if len(links) < 1:
             return []
 
         items = []
@@ -309,11 +306,20 @@ class ExtractProjector:
 
         sorted_nodes = sorted(nodes, key=node_priority)
 
+        source_node = None
         for node in sorted_nodes:
             href = node.get("href", "")
             if href:
                 item[url_field] = self._normalize_url(href, node.get("url", ""))
+                source_node = node
                 break
+
+        if source_node:
+            item.setdefault("detail_url", item.get(url_field, ""))
+            item.setdefault("href", source_node.get("href", ""))
+            item.setdefault("item_ref", source_node.get("ref", ""))
+            item.setdefault("source_page_url", source_node.get("url", ""))
+            item.setdefault("text", source_node.get("text") or source_node.get("name", ""))
 
         title_candidates = []
         for node in sorted_nodes:

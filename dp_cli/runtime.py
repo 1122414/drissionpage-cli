@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import AbstractContextManager
 
 from dp_cli.fingerprint import FingerprintIndex, NodeFingerprint
@@ -17,6 +18,85 @@ class RuntimeContext(AbstractContextManager):
         self.tab = tab
         self.fingerprint_index = FingerprintIndex()
         self.locator_generator = LocatorGenerator()
+
+    def _tab_is_usable(self, tab) -> bool:
+        try:
+            getattr(tab, "tab_id", None)
+            getattr(tab, "url", None)
+            return True
+        except Exception:
+            return False
+
+    def refresh_active_tab(self) -> dict:
+        old_tab_id = getattr(self.tab, "tab_id", None)
+        old_url = getattr(self.tab, "url", None)
+        changed = False
+        try:
+            latest = self.browser.latest_tab
+        except Exception:
+            latest = None
+        if latest is not None and self._tab_is_usable(latest):
+            latest_tab_id = getattr(latest, "tab_id", None)
+            latest_url = getattr(latest, "url", None)
+            if latest_tab_id != old_tab_id or latest_url != old_url:
+                self.tab = latest
+                changed = True
+        self.sync_page_identity()
+        return {
+            "active_tab_changed": changed,
+            "old_tab_id": old_tab_id,
+            "new_tab_id": getattr(self.tab, "tab_id", None),
+            "old_url": old_url,
+            "new_url": getattr(self.tab, "url", None),
+        }
+
+    def refresh_after_possible_tab_change(self, before_tab_ids: set[str], timeout: float = 1.5) -> dict:
+        before_tab_id = getattr(self.tab, "tab_id", None)
+        deadline = time.time() + timeout
+        transition = {
+            "opened_new_tab": False,
+            "active_tab_changed": False,
+            "old_tab_id": before_tab_id,
+            "new_tab_id": before_tab_id,
+            "old_url": getattr(self.tab, "url", None),
+            "new_url": getattr(self.tab, "url", None),
+        }
+        while True:
+            current_ids = set(getattr(self.browser, "tab_ids", []) or [])
+            latest = None
+            try:
+                latest = self.browser.latest_tab
+            except Exception:
+                latest = None
+            latest_id = getattr(latest, "tab_id", None) if latest is not None else None
+            opened_new_tab = bool(current_ids - before_tab_ids)
+            latest_changed = latest_id is not None and latest_id != before_tab_id
+            if latest is not None and self._tab_is_usable(latest) and (opened_new_tab or latest_changed):
+                self.tab = latest
+                self.sync_page_identity()
+                transition.update(
+                    {
+                        "opened_new_tab": opened_new_tab,
+                        "active_tab_changed": latest_changed,
+                        "new_tab_id": getattr(self.tab, "tab_id", None),
+                        "new_url": getattr(self.tab, "url", None),
+                    }
+                )
+                return transition
+            if time.time() >= deadline:
+                break
+            time.sleep(0.1)
+
+        refreshed = self.refresh_active_tab()
+        transition.update(
+            {
+                "opened_new_tab": False,
+                "active_tab_changed": refreshed.get("active_tab_changed", False),
+                "new_tab_id": refreshed.get("new_tab_id"),
+                "new_url": refreshed.get("new_url"),
+            }
+        )
+        return transition
 
     def current_page_info(self) -> dict:
         return {
