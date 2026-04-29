@@ -139,11 +139,6 @@ class CliService:
             if mode == "full":
                 payload["count"] = len(nodes)
                 payload["nodes"] = nodes
-                payload["index"] = index
-            elif mode == "agent_summary":
-                payload["index"] = index
-            else:
-                payload["index"] = index
             return payload
 
     def find_elements(
@@ -1353,14 +1348,13 @@ class CliService:
         return False
 
     def _absolute_href(self, node: dict) -> str:
-        href = node.get("href") or ""
-        return urljoin(node.get("url") or "", href)
+        return self._absolute_url(node.get("href") or "", node.get("url") or "")
 
     def _detail_item_url(self, item: dict, source_url: str = "") -> str:
         raw_url = item.get("detail_url") or item.get("url") or item.get("href") or ""
         if not isinstance(raw_url, str):
             return ""
-        return urljoin(source_url or "", raw_url.strip())
+        return self._absolute_url(raw_url, source_url)
 
     def _is_redundant_action_parent(self, node: dict, children: dict[str, list[dict]]) -> bool:
         if node.get("role") != "button" or node.get("tag") not in {"div", "span"}:

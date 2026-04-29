@@ -129,6 +129,19 @@ _COMMAND_MAP: dict[str, Callable[[argparse.Namespace, CliService], dict[str, Any
     "open": lambda a, s: success(
         a.session, "open", s.open_page(a.url, session=a.session, headless=a.headless, wait_time=a.wait_time)
     ),
+    "snapshot": lambda a, s: success(
+        a.session,
+        "snapshot",
+        s.snapshot_page(
+            session=a.session,
+            ref=getattr(a, "ref", None),
+            depth=getattr(a, "depth", None),
+            view=getattr(a, "view", None),
+            mode=getattr(a, "mode", "agent_summary"),
+            headless=a.headless,
+            wait_time=a.wait_time,
+        ),
+    ),
     "find": lambda a, s: success(
         a.session,
         "find",
@@ -264,23 +277,6 @@ def _load_items_arg(args: argparse.Namespace) -> list[dict]:
 
 
 def dispatch(args: argparse.Namespace, service: CliService) -> dict[str, Any]:
-    if args.command == "snapshot":
-        view = getattr(args, "view", None)
-        mode = getattr(args, "mode", "agent_summary")
-        if view is not None:
-            mode = "full" if view == "full" else "agent_summary"
-        return success(
-            args.session,
-            "snapshot",
-            service.snapshot_page(
-                session=args.session,
-                ref=getattr(args, "ref", None),
-                depth=getattr(args, "depth", None),
-                mode=mode,
-                headless=args.headless,
-                wait_time=args.wait_time,
-            ),
-        )
     handler = _COMMAND_MAP.get(args.command)
     if handler:
         return handler(args, service)

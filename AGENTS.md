@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-04-22
+**Generated:** 2026-04-29
 
 ## OVERVIEW
 
@@ -13,8 +13,9 @@ The main design contract is **semantic snapshot + ref-driven interaction**, not 
 ```
 .
 ├── dp_cli/           # Core package (CLI, service, adapter, session)
+├── tests/            # pytest suite (local + public smoke) — has own AGENTS.md
 ├── scripts/          # Runnable smoke tests and agent loop demos
-├── tests/            # pytest suite (local + public smoke)
+├── reference_script/ # Prototype/reference code (not part of package)
 ├── .dpcli/           # Runtime state (sessions, snapshots) — gitignored
 ├── pytest.ini        # Markers: smoke
 └── now.md            # Living project status doc (Chinese)
@@ -32,6 +33,12 @@ The main design contract is **semantic snapshot + ref-driven interaction**, not 
 | Persistence / paths | `dp_cli/session_store.py` | `.dpcli/sessions/<name>/` layout |
 | Data models | `dp_cli/models.py` | dataclasses: `SessionState`, `SnapshotNodeRecord`, etc. |
 | Error types | `dp_cli/errors.py` | Structured `CliError` with `code`, `exit_code` |
+| DOM compression | `dp_cli/compressor.py` | Node grouping and compression |
+| Planner projection | `dp_cli/projector.py` | Low-token agent view + extraction |
+| Group detection | `dp_cli/grouper.py` | Group kind detection, field schema |
+| Locator candidates | `dp_cli/locator.py` | Ref → CSS/XPath resolution |
+| Node fingerprinting | `dp_cli/fingerprint.py` | Stable ref resolution; **changing hash inputs invalidates stored refs** |
+| AI extraction | `dp_cli/ai_extractor.py` | LLM-powered detail extraction |
 | Run local smoke | `scripts/test_local_cli.py` | Uses `tests.support` fixture server |
 | Run agent loop demo | `scripts/test_min_agent_loop.py` | Needs OpenAI config filled in |
 | Add test | `tests/test_cli_local.py` | Uses `run_cli()` helper from `tests/support.py` |
@@ -67,12 +74,16 @@ The main design contract is **semantic snapshot + ref-driven interaction**, not 
 - Do **not** let `click`/`type` accept container refs (`r*`) — must return `invalid_ref_type`
 - Do **not** store runtime data outside `.dpcli/`
 - Do **not** expose raw DrissionPage objects past `adapter.py` into `service.py` callers
+- Do **not** persist secrets in `.dpcli/` JSON files
 
 ## UNIQUE STYLES
 
 - CLI is designed for `python -m dp_cli`, not a standalone console script
 - `scripts/` and `tests/` both contain runnable workflows; `scripts/` are demos, `tests/` are assertions
+- Tests invoke CLI via subprocess (`run_cli()`), not direct import — black-box integration style
 - `now.md` is a living bilingual project status doc, not a roadmap
+- `service.py` is a monolith (~1500 lines) — the single orchestration boundary
+- `adapter.py` embeds multi-hundred-line JS as Python string literals for DOM discovery
 
 ## COMMANDS
 
@@ -94,5 +105,8 @@ python scripts/test_min_agent_loop.py   # needs OpenAI config
 ## NOTES
 
 - No lint/format config present (no ruff, black, flake8, mypy). Follow existing file style.
+- No CI/CD configuration. No Makefile, no tox, no GitHub Actions.
 - Browser runtime is required; `conftest.py` auto-skips if browser is unavailable.
 - Session identity includes `session_id`, `runtime_id`, `page_id`, `snapshot_id` to prevent stale ref reuse.
+- `fingerprint.py` has 6 stubbed no-op methods; changing hash function internals invalidates all stored refs.
+- `session_store.py` has deprecated legacy field migrations scheduled for removal after 2026-07-01.

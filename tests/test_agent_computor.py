@@ -61,11 +61,15 @@ SCENARIOS = {
     # 成功detail_batch_input_test-scrawl_info_1777285872.json
     # "scrawl_info": "去这个网站，https://www.wangfei.la/，进入左侧电影栏目，爬取前两页的电影信息，注意要点进每一部电影去获取其详情信息，并存储为json文件"
 
-    # 未成功
-    "scrawl_info_rank_info": "去这个网站，http://guozhivip.com/rank/，爬取主页栏目中各个榜单的详细信息，注意要点击进去"
+    # 半成功
+    # "scrawl_info_rank_info": "去这个网站，http://guozhivip.com/rank/，爬取主页栏目中各个榜单的详细信息，注意要点击进去"
 
     # test_download 成功
     # "download_music": "去这个网站，https://www.fangpi.net/，搜索那天下雨了，选择第一个选项，然后下载歌词"
+
+    # https://www.qidian.com/rank/
+    "crawl_novel": "去这个网站，https://www.qidian.com/rank/，爬取各个榜单小说信息，并且点击各个小说获取其简介"
+
     
 }
 
