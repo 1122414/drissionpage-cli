@@ -185,11 +185,13 @@ def test_click_target_blank_switches_runtime_to_new_tab(local_fixture_server, lo
         evaluated = run_cli("eval", "document.title", "--session", local_session, "--headless")
         assert evaluated["ok"] is True
         assert evaluated["data"]["result"] == "Detail Fixture"
+        assert evaluated["data"]["page"]["url"] == found_detail["data"]["page"]["url"]
+        assert evaluated["data"]["page_identity"]["page_id"]
     finally:
         cleanup_session(local_session)
 
 
-def test_live_session_updates_headless_mode_on_command(local_fixture_server, local_session):
+def test_live_session_rejects_headless_mode_change(local_fixture_server, local_session):
     manager = SessionManager()
     try:
         opened = run_cli("open", local_fixture_server.url, "--session", local_session)
@@ -199,11 +201,22 @@ def test_live_session_updates_headless_mode_on_command(local_fixture_server, loc
         before = json.loads(meta_path.read_text(encoding="utf-8"))
         assert before["headless"] is False
 
-        found = run_cli("find", "--session", local_session, "--headless", "--text", "Movies")
-        assert found["ok"] is True
+        found = run_cli(
+            "find",
+            "--session",
+            local_session,
+            "--headless",
+            "--text",
+            "Movies",
+            check=False,
+        )
+        assert found["ok"] is False
+        assert found["error"]["code"] == "browser_config_error"
+        assert found["error"]["details"]["active_headless"] is False
+        assert found["error"]["details"]["requested_headless"] is True
 
         after = json.loads(meta_path.read_text(encoding="utf-8"))
-        assert after["headless"] is True
+        assert after["headless"] is False
     finally:
         cleanup_session(local_session)
 
@@ -228,6 +241,115 @@ def test_session_inspect_returns_agent_friendly_identity(local_fixture_server, l
         assert data["last_snapshot_mode"] == "agent_summary"
     finally:
         cleanup_session(local_session)
+
+
+def test_live_headless_session_keeps_mode_when_flag_is_omitted(local_fixture_server, local_session):
+    manager = SessionManager()
+    try:
+        opened = run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        assert opened["ok"] is True
+
+        inspected = run_cli("session", "inspect", "--session", local_session)
+        assert inspected["ok"] is True
+        assert inspected["data"]["runtime"]["headless"] is True
+
+        meta = json.loads(
+            manager.session_paths(local_session).meta_file.read_text(encoding="utf-8")
+        )
+        assert meta["headless"] is True
+    finally:
+        cleanup_session(local_session)
+
+
+def test_session_close_stops_browser(local_fixture_server, local_session):
+    manager = SessionManager()
+    try:
+        opened = run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        assert opened["ok"] is True
+
+        closed = run_cli("session", "close", "--session", local_session)
+        assert closed["ok"] is True
+        assert closed["action"] == "session.close"
+        assert closed["data"]["closed"] is True
+        assert closed["data"]["was_running"] is True
+
+        meta = json.loads(
+            manager.session_paths(local_session).meta_file.read_text(encoding="utf-8")
+        )
+        assert meta["runtime_status"] == "stopped"
+        assert meta["browser_pid"] is None
+    finally:
+        cleanup_session(local_session)
+
+
+def test_session_close_waits_for_debug_port_release(monkeypatch, tmp_path):
+    import dp_cli.session as session_module
+
+    manager = SessionManager(base_dir=tmp_path / ".dpcli")
+    manager.load_meta(session="close-race", headless=True)
+    listening_states = iter([True, True, False])
+    quit_calls = []
+
+    class FakeChromium:
+        def __init__(self, _options):
+            pass
+
+        def quit(self, timeout=5, force=False):
+            quit_calls.append({"timeout": timeout, "force": force})
+
+    monkeypatch.setattr(
+        session_module,
+        "port_is_listening",
+        lambda _port: next(listening_states),
+    )
+    monkeypatch.setattr(session_module, "Chromium", FakeChromium)
+    monkeypatch.setattr(session_module.time, "sleep", lambda _seconds: None)
+
+    closed = manager.close_session("close-race")
+
+    assert closed["closed"] is True
+    assert closed["was_running"] is True
+    assert closed["forced"] is False
+    assert quit_calls == [{"timeout": 5, "force": False}]
+
+
+def test_session_close_forces_exit_only_after_wait_timeout(monkeypatch, tmp_path):
+    import dp_cli.session as session_module
+
+    manager = SessionManager(base_dir=tmp_path / ".dpcli")
+    manager.load_meta(session="close-force", headless=True)
+    listening_states = iter([True, True, False])
+    monotonic_values = iter([0.0, 6.0, 10.0])
+    quit_calls = []
+
+    class FakeChromium:
+        def __init__(self, _options):
+            pass
+
+        def quit(self, timeout=5, force=False):
+            quit_calls.append({"timeout": timeout, "force": force})
+
+    monkeypatch.setattr(
+        session_module,
+        "port_is_listening",
+        lambda _port: next(listening_states),
+    )
+    monkeypatch.setattr(session_module, "Chromium", FakeChromium)
+    monkeypatch.setattr(
+        session_module.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(session_module.time, "sleep", lambda _seconds: None)
+
+    closed = manager.close_session("close-force")
+
+    assert closed["closed"] is True
+    assert closed["forced"] is True
+    assert quit_calls == [
+        {"timeout": 5, "force": False},
+        {"timeout": 5, "force": True},
+    ]
 
 
 def test_runtime_persist_keeps_meta_and_state_identity(local_fixture_server, local_session):
@@ -570,6 +692,405 @@ def test_snapshot_index_detects_generic_content_links_without_detail_tokens():
     assert index["data_regions"][0]["sample_items"][0]["url"] == "https://example.test/products/1"
 
 
+def test_snapshot_index_rejects_script_and_navigation_links_from_data_region():
+    service = CliService()
+    assert service._is_extractable_item_link(
+        {
+            "ref_type": "element",
+            "role": "link",
+            "href": "javascript:void(0)",
+            "text": "展开更多",
+        }
+    ) is False
+    assert service._is_extractable_item_link(
+        {
+            "ref_type": "element",
+            "role": "link",
+            "href": "/author/42",
+            "text": "作者甲",
+        }
+    ) is False
+    assert service._is_extractable_item_link(
+        {
+            "ref_type": "element",
+            "role": "link",
+            "href": "category/books/travel_2/index.html",
+            "text": "Travel",
+        }
+    ) is False
+    assert service._is_extractable_item_link(
+        {
+            "ref_type": "element",
+            "role": "link",
+            "href": "/products/42",
+            "text": "Product 42",
+        }
+    ) is True
+
+
+def test_snapshot_index_prefers_content_list_over_relative_category_sidebar():
+    def container(ref: str, tag: str, xpath: str, name: str) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "container",
+            "tag": tag,
+            "role": "",
+            "name": name,
+            "text": name,
+            "xpath": xpath,
+            "depth": 3,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": False,
+            },
+            "states": {
+                "disabled": False,
+                "checked": False,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    def link(ref: str, href: str, text: str, xpath: str) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": text,
+            "text": text,
+            "href": href,
+            "url": "https://books.example/catalogue/page-2.html",
+            "xpath": xpath,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": True,
+            },
+            "states": {
+                "disabled": False,
+                "checked": False,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    category_links = [
+        link(
+            f"e{i}",
+            f"category/books/category-{i}/index.html",
+            f"Category {i}",
+            f"/html/body/aside/ul/li[{i}]/a",
+        )
+        for i in range(1, 7)
+    ]
+    product_links = [
+        link(
+            f"e{i + 10}",
+            f"book-{i}/index.html",
+            f"Book {i}",
+            f"/html/body/main/ol/li[{i}]/article/a",
+        )
+        for i in range(1, 5)
+    ]
+    nodes = [
+        container("r1", "ul", "/html/body/aside/ul", "Categories"),
+        container("r2", "ol", "/html/body/main/ol", "Books"),
+        *category_links,
+        *product_links,
+    ]
+
+    index = CliService()._build_index(nodes)
+
+    assert index["data_regions"][0]["ref"] == "r2"
+    assert all(region["ref"] != "r1" for region in index["data_regions"])
+
+
+def test_snapshot_index_rejects_taxonomy_and_tracking_regions():
+    def container(ref: str, xpath: str, depth: int, name: str) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "container",
+            "tag": "div",
+            "role": "",
+            "name": name,
+            "text": name,
+            "xpath": xpath,
+            "depth": depth,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": False,
+            },
+            "states": {
+                "disabled": False,
+                "checked": False,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    def link(ref: str, href: str, text: str, xpath: str) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": text,
+            "text": text,
+            "href": href,
+            "url": "https://movie.example/chart",
+            "xpath": xpath,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": True,
+            },
+            "states": {
+                "disabled": False,
+                "checked": False,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    taxonomy = [
+        link(
+            f"e{i}",
+            f"/typerank?type={i}",
+            f"类型{i}",
+            f"/html/body/main/aside/a[{i}]",
+        )
+        for i in range(1, 7)
+    ]
+    tracking = [
+        link(
+            f"t{i}",
+            f"https://track.example/promotion?link={i}",
+            f"合作媒体{i}",
+            f"/html/body/main/div[1]/a[{i}]",
+        )
+        for i in range(1, 7)
+    ]
+    content = [
+        link(
+            f"c{i}",
+            f"/subject/{i}/",
+            f"真实内容标题 {i}",
+            f"/html/body/main/section/article[{i}]/a",
+        )
+        for i in range(1, 7)
+    ]
+    nodes = [
+        container("r1", "/html/body/main/aside", 4, "类型筛选"),
+        container("r2", "/html/body/main/div[1]", 5, "合作媒体"),
+        container("r3", "/html/body/main/section", 3, "主要内容"),
+        *taxonomy,
+        *tracking,
+        *content,
+    ]
+
+    index = CliService()._build_index(nodes)
+
+    assert index["data_regions"][0]["ref"] == "r3"
+    assert all(region["ref"] not in {"r1", "r2"} for region in index["data_regions"])
+
+
+def test_projection_item_refs_prefer_detail_links_over_taxonomy_links():
+    nodes = [
+        {
+            "ref": "category-1",
+            "ref_type": "element",
+            "role": "link",
+            "href": "/typerank?type=1",
+            "text": "剧情片",
+        },
+        {
+            "ref": "promotion-1",
+            "ref_type": "element",
+            "role": "link",
+            "href": "/promotion/partner",
+            "text": "合作推广",
+        },
+        *[
+            {
+                "ref": f"trailer-{index}",
+                "ref_type": "element",
+                "role": "link",
+                "href": f"/subject/{index}/trailer",
+                "text": "link",
+            }
+            for index in range(1, 6)
+        ],
+        *[
+            {
+                "ref": f"movie-{index}",
+                "ref_type": "element",
+                "role": "link",
+                "href": f"/subject/{index}/",
+                "text": f"真实电影标题 {index}",
+            }
+            for index in range(1, 6)
+        ],
+        {
+            "ref": "movie-description",
+            "ref_type": "element",
+            "role": "",
+            "href": "",
+            "text": "电影简介",
+        },
+    ]
+
+    refs = CliService()._projection_item_refs(nodes)
+
+    assert refs == [f"movie-{index}" for index in range(1, 6)]
+
+
+def test_snapshot_index_rejects_div_based_footer_navigation_regions():
+    footer_text = (
+        "Contact us Privacy Policy Site navigation Follow us "
+        "Copyright 2006-2026 ICP report email"
+    )
+    nodes = [
+        {
+            "ref": "footer-root",
+            "ref_type": "container",
+            "tag": "div",
+            "role": "",
+            "name": "footer",
+            "text": footer_text,
+            "xpath": "/html/body[1]/div[3]",
+            "depth": 1,
+        },
+        {
+            "ref": "footer-nav",
+            "ref_type": "container",
+            "tag": "dl",
+            "role": "",
+            "name": "site navigation",
+            "text": "Site navigation Features News Community Follow us",
+            "xpath": "/html/body[1]/div[3]/div[1]/dl[1]",
+            "depth": 3,
+        },
+        *[
+            {
+                "ref": f"footer-link-{index}",
+                "ref_type": "element",
+                "tag": "a",
+                "role": "link",
+                "name": title,
+                "text": title,
+                "href": href,
+                "url": "https://example.test/",
+                "xpath": (
+                    "/html/body[1]/div[3]/div[1]/dl[1]"
+                    f"/dd[{index}]/a[1]"
+                ),
+                "depth": 5,
+            }
+            for index, (title, href) in enumerate(
+                [
+                    ("Feature planning", "/feature/"),
+                    ("Global news", "/news/"),
+                    ("Community", "/community/"),
+                    ("Follow us", "/follow/"),
+                    ("Feedback", "/feedback/"),
+                ],
+                1,
+            )
+        ],
+    ]
+
+    regions = CliService()._detect_data_regions(nodes)
+
+    assert regions == []
+
+
+def test_snapshot_index_prefers_article_titles_over_short_menu_links():
+    def container(ref: str, xpath: str, depth: int) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "container",
+            "tag": "div",
+            "role": "",
+            "name": ref,
+            "text": ref,
+            "xpath": xpath,
+            "depth": depth,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": False,
+            },
+            "states": {
+                "disabled": False,
+                "checked": False,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    def link(ref: str, href: str, text: str, xpath: str) -> dict:
+        return {
+            "ref": ref,
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": text,
+            "text": text,
+            "href": href,
+            "url": "https://example.test/",
+            "xpath": xpath,
+            "visibility": {
+                "visible": True,
+                "in_viewport": True,
+                "interactable_now": True,
+            },
+            "states": {
+                "disabled": False,
+                "checked": False,
+                "selected": False,
+                "expanded": False,
+            },
+            "semantic_level": "surface",
+        }
+
+    menu = [
+        link(
+            f"m{i}",
+            f"/menu-{i}/",
+            text,
+            f"/html/body/main/div[1]/a[{i}]",
+        )
+        for i, text in enumerate(("精华", "候选", "订阅", "分类", "标签"), 1)
+    ]
+    articles = [
+        link(
+            f"a{i}",
+            f"/writer-name/p/{i}",
+            f"这是第{i}篇具有实际语义的中文文章标题",
+            f"/html/body/main/div[2]/article[{i}]/a",
+        )
+        for i in range(1, 6)
+    ]
+    nodes = [
+        container("r1", "/html/body/main/div[1]", 5),
+        container("r2", "/html/body/main/div[2]", 3),
+        *menu,
+        *articles,
+    ]
+
+    index = CliService()._build_index(nodes)
+
+    assert index["data_regions"][0]["ref"] == "r2"
+
+
 def test_extract_projector_outputs_relative_detail_links_with_schema():
     nodes = [
         {
@@ -596,6 +1117,41 @@ def test_extract_projector_outputs_relative_detail_links_with_schema():
         "url": "https://example.test/vod-detail-id-1.html",
         "title": "Movie 1",
     }
+
+
+def test_extract_projector_deduplicates_cover_and_title_links_by_url():
+    nodes = [
+        {
+            "ref": "e1",
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": "Cover image",
+            "text": "Cover image",
+            "href": "/catalogue/book-one/index.html",
+            "url": "https://example.test/",
+        },
+        {
+            "ref": "e2",
+            "ref_type": "element",
+            "tag": "a",
+            "role": "link",
+            "name": "Book One",
+            "text": "Book One",
+            "href": "/catalogue/book-one/index.html",
+            "url": "https://example.test/",
+        },
+    ]
+
+    result = ExtractProjector().project(
+        {"representative_ref": "r1", "item_refs": ["e1", "e2"]},
+        nodes,
+        ["title", "url"],
+    )
+
+    assert result["item_count"] == 1
+    assert result["items"][0]["url"] == "https://example.test/catalogue/book-one/index.html"
+    assert result["items"][0]["title"] == "Book One"
 
 
 def test_extract_projector_keeps_click_navigation_metadata_without_schema():
@@ -682,6 +1238,14 @@ def test_common_wait_time_argument_is_available_to_batch_detail_command():
     assert args.ai_timeout == 30
     assert args.output_file == "log/out.json"
     assert args.progress_file == "log/progress.jsonl"
+    assert args.headless is None
+
+
+def test_session_close_parser_does_not_require_browser_mode():
+    args = build_parser().parse_args(["session", "close", "--session", "unit"])
+    assert args.command == "session"
+    assert args.session_command == "close"
+    assert args.session == "unit"
 
 
 def test_batch_detail_ai_extractor_uses_generic_page_package(monkeypatch):
@@ -830,6 +1394,103 @@ def test_batch_detail_writes_incremental_output_and_progress(monkeypatch, tmp_pa
     assert progress_entries[0]["total"] == 3
     assert progress_entries[1]["detail_ok"] is False
     assert progress_entries[2]["detail_info"]["url"].endswith("/two")
+
+
+def test_batch_detail_rejects_non_http_url_without_opening_it(monkeypatch):
+    opened_urls = []
+
+    class FakeAdapter:
+        def page_info(self, tab):
+            return {"url": tab.url, "title": "Detail"}
+
+        def open_url(self, tab, url):
+            opened_urls.append(url)
+            tab.url = url
+            return self.page_info(tab)
+
+        def detail_page_package(self, tab):
+            return {"url": tab.url, "title": "Detail", "body_text": "Price: 12"}
+
+    class FakeTab:
+        url = "https://example.test/catalog"
+
+    class FakeRuntime:
+        def __init__(self):
+            self.tab = FakeTab()
+            self.state = type("State", (), {"active_page": type("Page", (), {"url": self.tab.url})()})()
+
+        def sync_page_identity(self):
+            self.state.active_page.url = self.tab.url
+
+        def persist(self):
+            pass
+
+    class FakeAiExtractor:
+        def extract(self, page_package, schema=None):
+            return {
+                "detail_info": {"price": "12"},
+                "fields": ["price"],
+                "confidence": 0.9,
+                "warnings": [],
+                "template": {"extract_strategy": "fake_ai"},
+            }
+
+    service = CliService(adapter=FakeAdapter())
+    runtime = FakeRuntime()
+
+    @contextmanager
+    def fake_runtime(*args, **kwargs):
+        yield runtime
+
+    monkeypatch.setattr(service, "_with_runtime", fake_runtime)
+    monkeypatch.setattr("dp_cli.service.AiDetailExtractor", FakeAiExtractor)
+
+    result = service.batch_extract_detail_pages(
+        [
+            {"title": "Bad", "url": "javascript:void(0)"},
+            {"title": "Good", "url": "https://example.test/item/good"},
+        ],
+        extractor="ai",
+        navigation_mode="direct",
+    )
+
+    assert result["items"][0]["detail_ok"] is False
+    assert "HTTP" in result["items"][0]["detail_error"]
+    assert result["items"][0]["requested_url"] == "javascript:void(0)"
+    assert opened_urls == ["https://example.test/item/good"]
+    assert result["items"][1]["final_url"] == "https://example.test/item/good"
+
+
+def test_batch_detail_legacy_js_extracts_semantic_fixture(local_fixture_server, local_session):
+    detail_url = local_fixture_server.url.replace("index.html", "detail.html")
+    try:
+        result = run_cli(
+            "batch-detail-extract",
+            "--session",
+            local_session,
+            "--headless",
+            "--items-json",
+            json.dumps([{"title": "Detail", "url": detail_url}]),
+            "--source-url",
+            local_fixture_server.url,
+            "--extractor",
+            "legacy-js",
+            "--navigation-mode",
+            "direct",
+            "--schema",
+            "title",
+            "description",
+        )
+
+        assert result["ok"] is True
+        row = result["data"]["items"][0]
+        assert row["detail_ok"] is True
+        assert row["requested_url"] == detail_url
+        assert row["final_url"] == detail_url
+        assert row["detail_info"]["title"] == "Structured Detail Fixture"
+        assert "Visible detail description" in row["detail_info"]["description"]
+    finally:
+        cleanup_session(local_session)
 
 
 def test_snapshot_index_prefers_leaf_text_button_over_wide_parent():

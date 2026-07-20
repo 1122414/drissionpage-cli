@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from dp_cli.models import RecoveryInfo
+from dp_cli.record_projection import StructuredRecordProjector
 
 
 @dataclass
@@ -92,7 +93,31 @@ class ExtractProjector:
         element_refs = [ref for ref in item_refs if lookup.get(ref, {}).get("ref_type") == "element"]
         container_refs = [ref for ref in item_refs if lookup.get(ref, {}).get("ref_type") == "container"]
 
-        if container_refs:
+        representative = lookup.get(
+            group.get("group_ref") or group.get("representative_ref"),
+            {},
+        )
+        root_xpath = str(
+            group.get("root_xpath")
+            or representative.get("xpath")
+            or ""
+        )
+        structured_items = (
+            StructuredRecordProjector(
+                normalize_url=self._normalize_url,
+            ).project(nodes, schema, root_xpath)
+            if schema and root_xpath
+            else []
+        )
+        structured_items = self._constrain_structured_items_to_seed_links(
+            structured_items,
+            element_refs,
+            lookup,
+        )
+
+        if structured_items:
+            items = structured_items
+        elif container_refs:
             items = self._extract_from_containers(container_refs, lookup, children_by_parent, schema)
         elif element_refs:
             items = self._extract_from_elements(element_refs, lookup, children_by_parent, schema)
@@ -132,6 +157,39 @@ class ExtractProjector:
             "fields": schema if schema else detected_schema,
             "items": items,
         }
+
+    def _constrain_structured_items_to_seed_links(
+        self,
+        items: list[dict],
+        element_refs: list[str],
+        lookup: dict[str, dict],
+    ) -> list[dict]:
+        seed_nodes = [lookup[ref] for ref in element_refs if ref in lookup]
+        if len(seed_nodes) < 3 or any(
+            node.get("role") != "link" or not node.get("href")
+            for node in seed_nodes
+        ):
+            return items
+
+        allowed_urls = {
+            self._normalize_url(
+                str(node.get("href") or ""),
+                str(node.get("url") or ""),
+            ).rstrip("/")
+            for node in seed_nodes
+        }
+        allowed_urls.discard("")
+        if not allowed_urls:
+            return items
+
+        return [
+            item
+            for item in items
+            if any(
+                str(item.get(field) or "").rstrip("/") in allowed_urls
+                for field in ("url", "href", "link", "detail_url")
+            )
+        ]
 
     def _extract_from_containers(
         self,
@@ -218,17 +276,61 @@ class ExtractProjector:
             return []
 
         items = []
-        seen: set[str] = set()
+        item_index_by_signature: dict[str, int] = {}
         for node in links:
             item = self._build_item([node], schema)
             if not item:
                 continue
-            signature = "|".join(str(item.get(key, "")) for key in ("url", "href", "link", "title", "name", "text"))
-            if signature in seen:
+            item_url = next(
+                (
+                    str(item.get(key) or "").rstrip("/")
+                    for key in ("url", "detail_url", "href", "link")
+                    if item.get(key)
+                ),
+                "",
+            )
+            signature = (
+                f"url:{item_url}"
+                if item_url
+                else "|".join(
+                    str(item.get(key, ""))
+                    for key in ("title", "name", "text")
+                )
+            )
+            existing_index = item_index_by_signature.get(signature)
+            if existing_index is not None:
+                if self._item_quality(item) > self._item_quality(items[existing_index]):
+                    items[existing_index] = item
                 continue
-            seen.add(signature)
+            item_index_by_signature[signature] = len(items)
             items.append(item)
         return items
+
+    @staticmethod
+    def _item_quality(item: dict[str, str]) -> int:
+        title = str(
+            item.get("title")
+            or item.get("name")
+            or item.get("text")
+            or ""
+        ).strip()
+        normalized = title.lower()
+        generic_titles = {
+            "link",
+            "image",
+            "cover",
+            "cover image",
+            "details",
+            "detail",
+            "read more",
+            "more",
+        }
+        score = min(len(title), 200)
+        if normalized in generic_titles:
+            score -= 500
+        if title.startswith(("http://", "https://")):
+            score -= 200
+        return score
 
     def _is_item_detail_link(self, node: dict) -> bool:
         href = (node.get("href") or "").lower()
@@ -237,7 +339,8 @@ class ExtractProjector:
     def _is_navigation_or_filter_link(self, node: dict) -> bool:
         href = (node.get("href") or "").lower()
         text = (node.get("text") or node.get("name") or "").strip().lower()
-        if href in {"", "#", "/"}:
+        parsed = urlparse(href)
+        if href in {"", "#", "/"} or parsed.scheme not in {"", "http", "https"}:
             return True
         noise_patterns = (
             "vod-show",
@@ -250,6 +353,20 @@ class ExtractProjector:
             "search",
             "label",
             "topic",
+            "/author/",
+            "/authors/",
+            "/writer/",
+            "/user/",
+            "/profile/",
+            "/category/",
+            "/categories/",
+            "/genre/",
+            "/rank",
+            "/ranking",
+            "/help",
+            "/login",
+            "/logout",
+            "/register",
         )
         if any(pattern in href for pattern in noise_patterns):
             return True
@@ -309,8 +426,9 @@ class ExtractProjector:
         source_node = None
         for node in sorted_nodes:
             href = node.get("href", "")
-            if href:
-                item[url_field] = self._normalize_url(href, node.get("url", ""))
+            normalized_url = self._normalize_url(href, node.get("url", "")) if href else ""
+            if normalized_url:
+                item[url_field] = normalized_url
                 source_node = node
                 break
 
@@ -354,9 +472,11 @@ class ExtractProjector:
         return item
 
     def _normalize_url(self, href: str, base_url: str = "") -> str:
-        if href.startswith("http://") or href.startswith("https://"):
-            return href
-        return urljoin(base_url or "", href)
+        value = urljoin(base_url or "", href)
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return value
 
 
 class TokenBudgetEnforcer:

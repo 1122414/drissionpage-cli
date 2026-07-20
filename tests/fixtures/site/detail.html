@@ -3,10 +3,20 @@
   <head>
     <meta charset="utf-8">
     <title>Detail Fixture</title>
+    <meta name="description" content="A stable local detail page used to verify semantic extraction.">
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "Article",
+        "name": "Structured Detail Fixture",
+        "description": "Structured detail description from JSON-LD."
+      }
+    </script>
   </head>
   <body>
     <main role="main" aria-label="Detail page">
       <h1>Detail Fixture Page</h1>
+      <p class="description">Visible detail description in the semantic main region.</p>
       <button id="detail-marker" type="button">New tab detail content</button>
     </main>
   </body>

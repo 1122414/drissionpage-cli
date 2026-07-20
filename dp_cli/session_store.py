@@ -127,8 +127,25 @@ class SessionStore:
             data.setdefault("runtime_status", "stale")
             data.setdefault("browser_pid", None)
             data.setdefault("last_seen_at", None)
-            if headless is not None:
-                data["headless"] = bool(headless)
+            if headless is not None and bool(headless) != bool(data.get("headless", False)):
+                requested_headless = bool(headless)
+                active_headless = bool(data.get("headless", False))
+                port = int(data.get("port") or 0)
+                if port and port_is_listening(port):
+                    raise BrowserConfigError(
+                        "Cannot change headless mode while the session browser is running.",
+                        {
+                            "session": session,
+                            "port": port,
+                            "active_headless": active_headless,
+                            "requested_headless": requested_headless,
+                            "fix_hint": "Reuse the active mode, or stop the session before changing headless mode.",
+                        },
+                    )
+                data["headless"] = requested_headless
+                data["runtime_id"] = new_id("rt")
+                data["runtime_status"] = "stale"
+                data["browser_pid"] = None
             write_json(paths.meta_file, data)
         return SessionMeta(**data)
 

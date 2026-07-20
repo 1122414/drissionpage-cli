@@ -5,11 +5,10 @@ import random
 import re
 import sys
 import time
-from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from dp_cli.adapter import DrissionPageAdapter
 from dp_cli.ai_extractor import AiDetailExtractor
@@ -23,6 +22,7 @@ from dp_cli.errors import (
     RefStaleError,
 )
 from dp_cli.models import DEFAULT_SESSION, SNAPSHOT_DEFAULT_DEPTH, SnapshotArtifact
+from dp_cli.record_projection import group_record_nodes
 from dp_cli.session import SessionManager
 
 PAGINATION_KEYWORDS = {
@@ -293,28 +293,38 @@ class CliService:
             self._wait(wait_time)
             runtime.begin_snapshot()
             target_item = self._ref_item(runtime, target_ref)
-            records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=target_item["xpath"], depth=6)
+            # Broad portal regions can place repeated cards 8-16 levels below
+            # their semantic wrapper while shallow sidebars sit closer to the
+            # root.  A depth of 6 therefore exposed only filters on pages such
+            # as movie charts.  Capture enough descendants to reach the cards.
+            records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=target_item["xpath"], depth=16)
             nodes = runtime.upsert_nodes(records)
             from dp_cli.projector import ExtractProjector
             projector = ExtractProjector()
             compressed_groups = self._compress_nodes(nodes)
+            projection_item_refs = self._projection_item_refs(nodes)
             if compressed_groups:
                 cg = compressed_groups[0]
-                all_element_refs = [n["ref"] for n in nodes if n["ref_type"] == "element"]
                 group = {
+                    "group_ref": target_ref,
                     "representative_ref": cg.representative_ref,
-                    "item_refs": all_element_refs,
+                    "item_refs": projection_item_refs,
                     "count": cg.count,
+                    "root_xpath": target_item["xpath"],
                 }
             else:
                 group = {
+                    "group_ref": target_ref,
                     "representative_ref": target_ref,
-                    "item_refs": [n["ref"] for n in nodes if n["ref_type"] == "element"],
+                    "item_refs": projection_item_refs,
+                    "root_xpath": target_item["xpath"],
                 }
             result = projector.project(group, nodes, schema)
             if limit is not None and limit > 0:
                 result["items"] = result["items"][:limit]
                 result["item_count"] = len(result["items"])
+            result["page"] = self._page_payload(runtime)
+            result["page_identity"] = self._page_identity_payload(runtime)
             runtime.persist()
             return result
 
@@ -334,6 +344,8 @@ class CliService:
                 "confidence": 0.9 if item.get("fingerprint") else 0.0,
                 "locator_candidates": item.get("locator_candidates", []),
                 "re_resolve_result": "matched",
+                "page": self._page_payload(runtime),
+                "page_identity": self._page_identity_payload(runtime),
             }
 
     def eval_js(
@@ -346,7 +358,11 @@ class CliService:
         with self._with_runtime(session=session, headless=headless) as runtime:
             self._wait(wait_time)
             result = runtime.tab.run_js(js, as_expr=True)
-            return {"result": result}
+            return {
+                "result": result,
+                "page": self._page_payload(runtime),
+                "page_identity": self._page_identity_payload(runtime),
+            }
 
     def batch_extract_detail_pages(
         self,
@@ -386,6 +402,7 @@ class CliService:
         detail_items = []
         detail_pages_extracted = 0
         detail_template = None
+        current_page: dict = {}
         max_attempts = max(1, int(max_retries or 1))
         item_timeout_value = self._positive_float(item_timeout)
         ai_timeout_value = self._positive_float(ai_timeout)
@@ -421,10 +438,13 @@ class CliService:
         with self._with_runtime(session=session, headless=headless) as runtime:
             for index, list_item in enumerate(list_items, start=1):
                 item_started_at = time.monotonic()
+                requested_url = self._raw_detail_item_url(list_item)
                 detail_url = self._detail_item_url(list_item, source)
                 merged = {
                     "title": list_item.get("title") or list_item.get("name"),
-                    "url": detail_url,
+                    "url": detail_url or requested_url,
+                    "requested_url": requested_url,
+                    "final_url": None,
                     "list_info": dict(list_item),
                     "detail_info": {},
                     "detail_ok": False,
@@ -433,7 +453,11 @@ class CliService:
                     "navigation_mode": navigation_mode,
                 }
                 if not detail_url:
-                    merged["detail_error"] = "Missing detail URL."
+                    merged["detail_error"] = (
+                        "Missing detail URL."
+                        if not requested_url
+                        else "Detail URL must use HTTP or HTTPS."
+                    )
                     detail_items.append(merged)
                     self._persist_batch_item(
                         output_path=output_path,
@@ -470,6 +494,13 @@ class CliService:
                             )
                             runtime.sync_page_identity()
                             self._wait(wait_time)
+                        final_url = self._runtime_page_url(runtime)
+                        merged["final_url"] = final_url
+                        if not self._detail_navigation_matches(detail_url, final_url, source):
+                            raise RuntimeError(
+                                "Detail navigation did not reach the requested page: "
+                                f"requested={detail_url!r}, final={final_url!r}."
+                            )
                         if self._item_timed_out(item_started_at, item_timeout_value):
                             raise TimeoutError(f"Item timeout after {item_timeout_value:.1f}s before extraction.")
                         extracted = self._extract_detail(
@@ -481,7 +512,18 @@ class CliService:
                         detail_info = extracted.get("detail_info") if isinstance(extracted, dict) else {}
                         if not isinstance(detail_info, dict):
                             detail_info = {}
-                        if detail_info:
+                        extracted_source = (
+                            str(extracted.get("source_url") or "")
+                            if isinstance(extracted, dict)
+                            else ""
+                        )
+                        if extracted_source and not self._same_document_url(extracted_source, final_url):
+                            errors.append(
+                                "Extractor source URL does not match final page: "
+                                f"source={extracted_source!r}, final={final_url!r}."
+                            )
+                            detail_info = {}
+                        if self._has_meaningful_detail(detail_info, schema):
                             merged["detail_info"] = detail_info
                             merged["detail_ok"] = True
                             merged["detail_error"] = None
@@ -515,8 +557,10 @@ class CliService:
                 self._wait(self._item_wait(wait_time, wait_jitter))
 
             runtime.persist()
+            current_page = self._page_payload(runtime)
 
         final_payload = current_payload(partial=False)
+        final_payload["page"] = current_page
         self._write_batch_output(output_path, final_payload)
         return final_payload
 
@@ -599,6 +643,9 @@ class CliService:
                 "last_snapshot_file": runtime.state.last_snapshot_file,
                 "last_snapshot_mode": runtime.state.last_snapshot_mode,
             }
+
+    def close_session(self, session: str = DEFAULT_SESSION) -> dict:
+        return self.sessions.close_session(session=session)
 
     @contextmanager
     def _with_runtime(self, session: str, headless: bool | None):
@@ -1150,25 +1197,59 @@ class CliService:
 
     def _detect_data_regions(self, nodes: list[dict]) -> list[dict]:
         lookup = {node["ref"]: node for node in nodes if node.get("ref")}
-        children = self._children_map(nodes)
         containers = [node for node in nodes if node.get("ref_type") == "container" and node.get("xpath")]
 
         candidates = []
         for container in containers:
-            descendants = self._descendant_elements(container["ref"], children)
-            if not descendants:
-                xpath = container.get("xpath") or ""
-                descendants = [
-                    node
-                    for node in nodes
-                    if node.get("ref_type") == "element" and node.get("xpath", "").startswith(xpath + "/")
-                ]
+            if self._is_footer_region(container, lookup):
+                continue
+            xpath = container.get("xpath") or ""
+            descendants = [
+                node
+                for node in nodes
+                if node.get("ref") != container.get("ref")
+                and str(node.get("xpath") or "").startswith(xpath.rstrip("/") + "/")
+            ]
             if len(descendants) < 3:
                 continue
-            link_nodes = [node for node in descendants if self._is_content_link(node)]
-            row_groups = self._row_groups(descendants)
-            repeated_count = max((len(group) for group in row_groups.values()), default=0)
-            item_count = max(len(link_nodes), repeated_count, len(row_groups))
+            link_nodes = [node for node in descendants if self._is_extractable_item_link(node)]
+            href_link_nodes = [
+                node
+                for node in descendants
+                if node.get("ref_type") == "element"
+                and node.get("role") == "link"
+                and str(node.get("href") or "").strip()
+            ]
+            non_link_content = [
+                node
+                for node in descendants
+                if node.get("role") != "link"
+                and str(
+                    node.get("text")
+                    or node.get("name")
+                    or ""
+                ).strip()
+            ]
+            if (
+                len(href_link_nodes) >= 3
+                and not link_nodes
+                and not non_link_content
+            ):
+                continue
+            row_groups = self._row_groups(descendants, xpath)
+            unique_link_count = len(
+                {
+                    self._absolute_href(node) or str(node.get("href") or "")
+                    for node in link_nodes
+                    if self._absolute_href(node) or str(node.get("href") or "")
+                }
+            )
+            record_count = len(row_groups)
+            item_count = (
+                record_count
+                if record_count >= 3
+                else unique_link_count
+            )
             if item_count < 3:
                 continue
             kind = self._data_region_kind(container, descendants, link_nodes, row_groups)
@@ -1210,49 +1291,160 @@ class CliService:
         return selected
 
     def _is_extractable_item_link(self, node: dict) -> bool:
-        return self._is_content_link(node)
+        return self._is_candidate_detail_link(node)
+
+    def _is_content_link(self, node: dict) -> bool:
+        return self._is_candidate_detail_link(node)
+
+    def _is_footer_region(self, container: dict, lookup: dict[str, dict]) -> bool:
+        role = str(container.get("role") or "").lower()
+        tag = str(container.get("tag") or "").lower()
+        if role == "contentinfo" or tag == "footer":
+            return True
+
+        xpath = str(container.get("xpath") or "").rstrip("/")
+        if not xpath:
+            return False
+        for node in lookup.values():
+            if node.get("ref_type") != "container":
+                continue
+            ancestor_xpath = str(node.get("xpath") or "").rstrip("/")
+            if not ancestor_xpath or (
+                xpath != ancestor_xpath
+                and not xpath.startswith(ancestor_xpath + "/")
+            ):
+                continue
+            text = self._normalized(
+                " ".join(
+                    str(value or "")
+                    for value in (
+                        node.get("name"),
+                        node.get("text"),
+                    )
+                )
+            )
+            if len(text) > 2500:
+                continue
+            footer_markers = (
+                ("contactus", "联系我们"),
+                ("privacypolicy", "隐私政策"),
+                ("sitenavigation", "站点导航"),
+                ("followus", "关注我们"),
+                ("copyright",),
+                ("icp", "备案"),
+                ("reportemail", "举报邮箱"),
+            )
+            marker_count = sum(
+                any(marker in text for marker in marker_group)
+                for marker_group in footer_markers
+            )
+            if marker_count >= 3:
+                return True
+        return False
+
+    def _projection_item_refs(self, nodes: list[dict]) -> list[str]:
+        all_element_refs = [
+            node["ref"]
+            for node in nodes
+            if node.get("ref_type") == "element" and node.get("ref")
+        ]
+        detail_link_refs = [
+            node["ref"]
+            for node in nodes
+            if node.get("ref") and self._is_extractable_item_link(node)
+        ]
+        # A repeated region with at least three detail links is a stronger seed
+        # than every descendant element in a broad wrapper.  Keep the full-node
+        # fallback for linkless tables, quote lists and form-like structures.
+        return detail_link_refs if len(detail_link_refs) >= 3 else all_element_refs
+
+    def _is_candidate_detail_link(self, node: dict) -> bool:
         if node.get("ref_type") != "element" or node.get("role") != "link":
             return False
-        href = (node.get("href") or "").lower()
+        href = (node.get("href") or "").strip().lower()
         text = (node.get("text") or node.get("name") or "").strip()
         if not href or len(text) < 2:
             return False
-        if any(token in href for token in ("detail", "/vod/", "/movie/", "/video/", "/item/")):
-            return True
-        if any(token in href for token in ("vod-show", "vod-type", "year-", "area-", "by-", "class-", "page-")):
+        parsed = urlparse(href)
+        if parsed.scheme not in {"", "http", "https"}:
             return False
-        if text in {"首页", "上一页", "下一页", "尾页", "全部"} or re.fullmatch(r"\d+", text):
-            return False
-        return False
-
-    def _is_content_link(self, node: dict) -> bool:
-        if node.get("ref_type") != "element" or node.get("role") != "link" or not node.get("href"):
-            return False
-        href = (node.get("href") or "").lower()
-        text = (node.get("text") or node.get("name") or "").strip()
-        if len(text) < 2:
-            return False
-        if href in {"#", "/", "javascript:void(0)"}:
+        if href.startswith(("#", "?")) or href in {"/", "./", "../"}:
             return False
         normalized_text = self._normalized(text)
         if normalized_text in PAGINATION_KEYWORDS or re.fullmatch(r"\d+", normalized_text):
             return False
-        if any(token in href for token in ("login", "logout", "register", "search", "tag/", "category", "page=")):
+        path_segments = {
+            segment
+            for segment in parsed.path.lower().split("/")
+            if segment
+        }
+        if path_segments & {
+            "author",
+            "authors",
+            "writer",
+            "user",
+            "profile",
+            "category",
+            "categories",
+            "genre",
+            "rank",
+            "ranking",
+            "search",
+            "tag",
+            "topic",
+            "typerank",
+            "trailer",
+            "trailers",
+            "photo",
+            "photos",
+            "video",
+            "videos",
+            "help",
+            "login",
+            "logout",
+            "register",
+        }:
             return False
-        return True
+        noise_patterns = (
+            "vod-show",
+            "vod-type",
+            "year-",
+            "area-",
+            "by-",
+            "class-",
+            "page-",
+            "/author/",
+            "/authors/",
+            "/writer/",
+            "/user/",
+            "/profile/",
+            "/category/",
+            "/categories/",
+            "/genre/",
+            "/rank",
+            "/ranking",
+            "/search",
+            "/tag/",
+            "/topic/",
+            "/typerank",
+            "/trailer",
+            "/trailers",
+            "/photo",
+            "/photos",
+            "/video",
+            "/videos",
+            "/promotion",
+            "/help",
+            "/login",
+            "/logout",
+            "/register",
+        )
+        if any(token in href for token in noise_patterns):
+            return False
+        return bool(parsed.path and parsed.path not in {"", "/"})
 
-    def _row_groups(self, nodes: list[dict]) -> dict[str, list[dict]]:
-        groups: dict[str, list[dict]] = defaultdict(list)
-        for node in nodes:
-            xpath = node.get("xpath") or ""
-            parts = xpath.split("/")
-            indexed = [i for i, part in enumerate(parts) if re.search(r"\[\d+\]", part)]
-            if indexed:
-                key = "/".join(parts[: indexed[-1] + 1])
-            else:
-                key = node.get("parent_ref") or xpath
-            groups[key].append(node)
-        return {key: value for key, value in groups.items() if value}
+    def _row_groups(self, nodes: list[dict], root_xpath: str = "") -> dict[str, list[dict]]:
+        return group_record_nodes(nodes, root_xpath)
 
     def _data_region_kind(
         self,
@@ -1279,19 +1471,38 @@ class CliService:
         row_groups: dict[str, list[dict]],
         lookup: dict[str, dict],
     ) -> int:
-        score = min(len(descendants), 80)
+        score = min(len(descendants), 30)
+        score += min(int(container.get("depth") or 0), 20) * 4
         score += min(len(link_nodes), 50) * 5
-        score += min(len(row_groups), 30) * 4
+        score += min(len(row_groups), 12) * 4
         if len(link_nodes) >= 3:
             score += 80
         if len(row_groups) >= 3:
             score += 60
+        if link_nodes:
+            titles = [
+                str(node.get("text") or node.get("name") or "").strip()
+                for node in link_nodes
+            ]
+            long_title_ratio = sum(len(title) >= 8 for title in titles) / len(titles)
+            short_title_ratio = sum(len(title) <= 4 for title in titles) / len(titles)
+            url_title_ratio = sum(
+                title.lower().startswith(("http://", "https://"))
+                for title in titles
+            ) / len(titles)
+            score += round(long_title_ratio * 100)
+            score -= round(short_title_ratio * 50)
+            score -= round(url_title_ratio * 100)
         role = (container.get("role") or "").lower()
         tag = (container.get("tag") or "").lower()
         if role in {"main", "region", "list", "table", "grid"} or tag in {"main", "section", "ul", "ol", "table"}:
             score += 40
         if role in {"navigation", "banner", "contentinfo", "form", "search"} or self._has_ancestor_role(container, lookup, {"navigation"}):
             score -= 140
+        if tag in {"html", "body", "nav", "header", "footer"}:
+            score -= 180
+        if descendants and len(link_nodes) / len(descendants) < 0.08:
+            score -= 80
         if len(container.get("text") or "") > 8000:
             score -= 60
         return score
@@ -1345,16 +1556,99 @@ class CliService:
         for item in selected:
             if item.get("ref") in ancestors and item.get("item_count", 0) >= candidate.get("item_count", 0):
                 return True
+            selected_ref = item.get("ref")
+            selected_ancestors = set()
+            while selected_ref:
+                parent = lookup.get(selected_ref, {}).get("parent_ref")
+                if not parent:
+                    break
+                selected_ancestors.add(parent)
+                selected_ref = parent
+            if (
+                candidate.get("ref") in selected_ancestors
+                and candidate.get("item_count", 0) <= item.get("item_count", 0) * 1.25
+            ):
+                return True
         return False
 
     def _absolute_href(self, node: dict) -> str:
         return self._absolute_url(node.get("href") or "", node.get("url") or "")
 
     def _detail_item_url(self, item: dict, source_url: str = "") -> str:
-        raw_url = item.get("detail_url") or item.get("url") or item.get("href") or ""
-        if not isinstance(raw_url, str):
+        raw_url = self._raw_detail_item_url(item)
+        if not raw_url:
             return ""
-        return self._absolute_url(raw_url, source_url)
+        absolute = self._absolute_url(raw_url, source_url)
+        return absolute if self._is_http_url(absolute) else ""
+
+    @staticmethod
+    def _raw_detail_item_url(item: dict) -> str:
+        raw_url = item.get("detail_url") or item.get("url") or item.get("href") or ""
+        return raw_url.strip() if isinstance(raw_url, str) else ""
+
+    @staticmethod
+    def _is_http_url(url: str) -> bool:
+        parsed = urlparse(str(url or "").strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    @staticmethod
+    def _canonical_document_url(url: str) -> str:
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        path = parsed.path or "/"
+        if path != "/":
+            path = path.rstrip("/")
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", parsed.query, ""))
+
+    def _same_document_url(self, left: str, right: str) -> bool:
+        return bool(left and right) and self._canonical_document_url(left) == self._canonical_document_url(right)
+
+    def _detail_navigation_matches(self, requested_url: str, final_url: str, source_url: str = "") -> bool:
+        if not self._is_http_url(final_url):
+            return False
+        if self._same_document_url(requested_url, final_url):
+            return True
+        if (
+            source_url
+            and self._same_document_url(source_url, final_url)
+            and not self._same_document_url(source_url, requested_url)
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _runtime_page_url(runtime) -> str:
+        state_url = getattr(getattr(runtime.state, "active_page", None), "url", None)
+        return str(state_url or getattr(runtime.tab, "url", "") or "")
+
+    @staticmethod
+    def _has_meaningful_detail(detail_info: dict, schema: list[str] | None = None) -> bool:
+        def meaningful(value) -> bool:
+            if value is None or value is False:
+                return False
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, (list, tuple, set, dict)):
+                return bool(value)
+            return True
+
+        meaningful_fields = {
+            str(key).strip().lower()
+            for key, value in detail_info.items()
+            if meaningful(value)
+            and str(key).strip().lower() not in {"source_url", "page_url"}
+        }
+        if not meaningful_fields:
+            return False
+        requested_fields = {
+            str(field).strip().lower()
+            for field in (schema or [])
+            if str(field).strip()
+        }
+        if not requested_fields:
+            return True
+        return len(meaningful_fields & requested_fields) / len(requested_fields) >= 0.5
 
     def _is_redundant_action_parent(self, node: dict, children: dict[str, list[dict]]) -> bool:
         if node.get("role") != "button" or node.get("tag") not in {"div", "span"}:

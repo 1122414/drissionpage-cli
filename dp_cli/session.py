@@ -7,7 +7,7 @@ from DrissionPage import Chromium, ChromiumOptions
 
 from dp_cli.models import DEFAULT_SESSION, SessionMeta, SessionPaths, SessionState
 from dp_cli.runtime import RuntimeContext
-from dp_cli.session_store import SessionStore
+from dp_cli.session_store import SessionStore, port_is_listening
 
 
 class SessionManager:
@@ -96,3 +96,52 @@ class SessionManager:
         ctx.refresh_active_tab()
         ctx.persist()
         return ctx
+
+    @staticmethod
+    def _wait_for_port_close(port: int, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while port_is_listening(port):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+        return True
+
+    def close_session(self, session: str = DEFAULT_SESSION) -> dict:
+        paths = self.session_paths(session)
+        if not paths.meta_file.exists():
+            return {"closed": False, "reason": "session_not_found", "session": session}
+
+        meta = self.load_meta(session=session)
+        was_running = port_is_listening(meta.port)
+        close_errors = []
+        forced = False
+        if was_running:
+            try:
+                Chromium(self._build_options(meta)).quit(timeout=5, force=False)
+            except Exception as exc:
+                close_errors.append(f"normal close failed: {exc}")
+
+            closed = self._wait_for_port_close(meta.port, timeout=5)
+            if not closed:
+                forced = True
+                try:
+                    Chromium(self._build_options(meta)).quit(timeout=5, force=True)
+                except Exception as exc:
+                    close_errors.append(f"forced close failed: {exc}")
+                closed = self._wait_for_port_close(meta.port, timeout=5)
+        else:
+            closed = True
+
+        still_running = not closed
+        meta.runtime_status = "running" if still_running else "stopped"
+        if not still_running:
+            meta.browser_pid = None
+        self.save_meta(meta)
+        return {
+            "closed": not still_running,
+            "was_running": was_running,
+            "session": session,
+            "port": meta.port,
+            "forced": forced,
+            "error": "; ".join(close_errors) or None,
+        }

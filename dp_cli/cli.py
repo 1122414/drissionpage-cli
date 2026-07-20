@@ -97,13 +97,15 @@ def build_parser() -> argparse.ArgumentParser:
     session_subparsers = session_parser.add_subparsers(dest="session_command", required=True)
     inspect_parser = session_subparsers.add_parser("inspect", help="Return agent-friendly session state.")
     _add_common_args(inspect_parser)
+    close_parser = session_subparsers.add_parser("close", help="Close the session browser without deleting artifacts.")
+    close_parser.add_argument("--session", default=DEFAULT_SESSION)
 
     return parser
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--headless", action="store_true", default=None)
     parser.add_argument("--wait-time", type=float, default=0.0)
 
 
@@ -256,8 +258,12 @@ _COMMAND_MAP: dict[str, Callable[[argparse.Namespace, CliService], dict[str, Any
     ),
     "session": lambda a, s: success(
         a.session,
-        "session.inspect",
-        s.inspect_session(session=a.session, headless=a.headless, wait_time=a.wait_time),
+        "session.close" if a.session_command == "close" else "session.inspect",
+        (
+            s.close_session(session=a.session)
+            if a.session_command == "close"
+            else s.inspect_session(session=a.session, headless=a.headless, wait_time=a.wait_time)
+        ),
     ),
 }
 

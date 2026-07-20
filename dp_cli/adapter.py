@@ -570,9 +570,40 @@ DETAIL_EXTRACTION_SCRIPT = SHARED_JS_HELPERS + """
   const text = node => compactText((node && (node.innerText || node.textContent)) || '');
   const attr = (node, name) => (node && node.getAttribute && node.getAttribute(name)) || '';
   const visibleElements = selector => Array.from(document.querySelectorAll(selector)).filter(isVisible);
+  const metaContent = selector => attr(document.querySelector(selector), 'content').trim();
+  const semanticRoot = document.querySelector('main, article, [role="main"]') || document.body;
+  const isNoiseScope = node => !!(node && node.closest && node.closest(
+    'nav, header, footer, aside, [role="navigation"], [role="contentinfo"], ' +
+    '[class*="recommend"], [class*="related"], [class*="sidebar"], [class*="catalog"], ' +
+    '[class*="comment"], [id*="recommend"], [id*="related"], [id*="sidebar"], ' +
+    '[id*="catalog"], [id*="comment"]'
+  ));
+  const jsonLdObjects = [];
+  for (const script of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
+    try {
+      const parsed = JSON.parse(script.textContent || '{}');
+      const values = Array.isArray(parsed) ? parsed : [parsed];
+      for (const value of values) {
+        if (!value || typeof value !== 'object') continue;
+        jsonLdObjects.push(value);
+        if (Array.isArray(value['@graph'])) jsonLdObjects.push(...value['@graph']);
+      }
+    } catch (_) {}
+  }
+  const structured = jsonLdObjects.find(value =>
+    value && typeof value === 'object' &&
+    (value.name || value.headline || value.description || value.image)
+  ) || {};
+  const structuredImage = value => {
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return structuredImage(value[0]);
+    if (value && typeof value === 'object') return value.url || value.contentUrl || '';
+    return '';
+  };
   const firstText = selectors => {
     for (const selector of selectors) {
       for (const node of visibleElements(selector)) {
+        if (isNoiseScope(node)) continue;
         const value = text(node);
         if (value) return value;
       }
@@ -580,11 +611,17 @@ DETAIL_EXTRACTION_SCRIPT = SHARED_JS_HELPERS + """
     return '';
   };
 
-  const title = firstText([
+  const title = compactText(
+    structured.name || structured.headline ||
+    metaContent('meta[property="og:title"]') ||
+    metaContent('meta[name="twitter:title"]')
+  ) || firstText([
+    'main h1',
+    'article h1',
+    '[role="main"] h1',
     'h1',
-    '.title',
-    '[class*="title"]',
-    '[class*="name"]',
+    'main .title',
+    'article .title',
     '.vodh h2',
     '.vodh h1'
   ]) || compactText(document.title || '');
@@ -867,7 +904,13 @@ class DrissionPageAdapter:
         return tab.run_js(DETAIL_PAGE_PACKAGE_SCRIPT, as_expr=True)
 
     def scroll_into_view(self, element) -> None:
-        element.run_js("this.scrollIntoView({block: 'center', inline: 'center'});")
+        try:
+            element.scroll.to_see(center=True)
+            return
+        except Exception:
+            element.run_js(
+                "this.scrollIntoView({block: 'center', inline: 'center'});"
+            )
 
     def click(self, element) -> None:
         offset = None
