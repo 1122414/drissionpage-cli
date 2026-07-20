@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 from typing import Any, Callable
@@ -129,6 +130,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--headless", action="store_true", default=None)
     parser.add_argument("--wait-time", type=float, default=0.0)
+    parser.add_argument(
+        "--request-id",
+        default=None,
+        help="Replay-safe idempotency key for one agent action.",
+    )
 
 
 def print_json(payload: dict[str, Any]) -> None:
@@ -319,9 +325,38 @@ def _load_items_arg(args: argparse.Namespace) -> list[dict]:
 
 def dispatch(args: argparse.Namespace, service: CliService) -> dict[str, Any]:
     handler = _COMMAND_MAP.get(args.command)
-    if handler:
-        return handler(args, service)
-    raise CliError("unknown_command", f"Unsupported command: {args.command}")
+    if not handler:
+        raise CliError("unknown_command", f"Unsupported command: {args.command}")
+
+    request_id = str(getattr(args, "request_id", None) or "").strip()
+    if len(request_id) > 200:
+        raise CliError(
+            "invalid_input",
+            "--request-id must not exceed 200 characters.",
+        )
+    store = service.sessions.store
+    if request_id:
+        cached = store.load_action_receipt(args.session, request_id)
+        if cached is not None:
+            replayed = copy.deepcopy(cached)
+            data = replayed.get("data")
+            if isinstance(data, dict):
+                data["_idempotency"] = {
+                    "request_id": request_id,
+                    "replayed": True,
+                }
+            return replayed
+
+    result = handler(args, service)
+    if request_id and result.get("ok"):
+        data = result.get("data")
+        if isinstance(data, dict):
+            data["_idempotency"] = {
+                "request_id": request_id,
+                "replayed": False,
+            }
+        store.save_action_receipt(args.session, request_id, copy.deepcopy(result))
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

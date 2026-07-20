@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -39,7 +40,15 @@ def read_json(path: Path, default: dict) -> dict:
 
 def write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def new_id(prefix: str) -> str:
@@ -69,6 +78,36 @@ class SessionStore:
             state_file=session_root / "state.json",
             profile_dir=session_root / "profile",
         )
+
+    def action_receipt_path(self, session: str, request_id: str) -> Path:
+        digest = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()
+        return self.session_paths(session).root / "receipts" / f"{digest}.json"
+
+    def load_action_receipt(self, session: str, request_id: str) -> dict | None:
+        path = self.action_receipt_path(session, request_id)
+        payload = read_json(path, {})
+        if not payload or payload.get("request_id") != request_id:
+            return None
+        result = payload.get("result")
+        return result if isinstance(result, dict) else None
+
+    def save_action_receipt(
+        self,
+        session: str,
+        request_id: str,
+        result: dict,
+    ) -> Path:
+        path = self.action_receipt_path(session, request_id)
+        write_json(
+            path,
+            {
+                "schema_version": 1,
+                "request_id": request_id,
+                "saved_at": utc_now(),
+                "result": result,
+            },
+        )
+        return path
 
     def detect_browser_path(self) -> str:
         env_path = os.environ.get("DPCLI_BROWSER_PATH")

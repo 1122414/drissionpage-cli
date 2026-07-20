@@ -1700,6 +1700,58 @@ def test_scroll_command_returns_before_after_metrics(local_fixture_server, local
         cleanup_session(local_session)
 
 
+def test_request_id_replays_browser_action_without_second_side_effect(
+    local_fixture_server,
+    local_session,
+):
+    try:
+        run_cli(
+            "open",
+            local_fixture_server.url,
+            "--session",
+            local_session,
+            "--headless",
+        )
+        request_id = f"{local_session}-scroll-once"
+        first = run_cli(
+            "scroll",
+            "--direction",
+            "down",
+            "--amount",
+            "700",
+            "--session",
+            local_session,
+            "--headless",
+            "--request-id",
+            request_id,
+        )
+        second = run_cli(
+            "scroll",
+            "--direction",
+            "down",
+            "--amount",
+            "700",
+            "--session",
+            local_session,
+            "--headless",
+            "--request-id",
+            request_id,
+        )
+
+        assert first["data"]["_idempotency"] == {
+            "request_id": request_id,
+            "replayed": False,
+        }
+        assert second["data"]["_idempotency"] == {
+            "request_id": request_id,
+            "replayed": True,
+        }
+        assert second["data"]["before"] == first["data"]["before"]
+        assert second["data"]["after"] == first["data"]["after"]
+    finally:
+        cleanup_session(local_session)
+
+
 def test_batch_detail_resumes_successful_rows_from_progress_file(
     local_fixture_server,
     local_session,
