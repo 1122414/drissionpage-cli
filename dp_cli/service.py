@@ -198,6 +198,7 @@ class CliService:
         session: str = DEFAULT_SESSION,
         ref: str | None = None,
         locator: str | None = None,
+        submit: bool = False,
         headless: bool | None = None,
         wait_time: float = 0.0,
     ) -> dict:
@@ -208,15 +209,74 @@ class CliService:
             locator=locator,
             text=text,
             element_error_message="Could not find element to type into.",
-            action=lambda element, value: self.adapter.type_text(element, value or ""),
+            action=lambda element, value: self.adapter.type_text(
+                element,
+                value or "",
+                submit=submit,
+            ),
             wait_time=wait_time,
             include_payload=lambda runtime, target_locator, state: {
                 "page": self._page_payload(runtime),
                 "target": self._target_payload(ref, target_locator),
                 "target_state": state,
                 "typed_text": text,
+                "submitted": bool(submit),
             },
         )
+
+    def scroll_page(
+        self,
+        session: str = DEFAULT_SESSION,
+        direction: str = "down",
+        amount: int = 900,
+        to: str | None = None,
+        headless: bool | None = None,
+        wait_time: float = 0.0,
+    ) -> dict:
+        normalized_direction = str(direction or "down").lower()
+        normalized_to = str(to or "").lower() or None
+        if normalized_direction not in {"down", "up", "left", "right"}:
+            raise InvalidInputError(
+                "scroll --direction must be one of: down, up, left, right."
+            )
+        if normalized_to not in {
+            None,
+            "top",
+            "bottom",
+            "half",
+            "leftmost",
+            "rightmost",
+        }:
+            raise InvalidInputError(
+                "scroll --to must be one of: top, bottom, half, leftmost, rightmost."
+            )
+        if int(amount) <= 0:
+            raise InvalidInputError("scroll --amount must be greater than zero.")
+
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            before = self.adapter.scroll_metrics(runtime.tab)
+            self.adapter.scroll_page(
+                runtime.tab,
+                direction=normalized_direction,
+                amount=int(amount),
+                to=normalized_to,
+            )
+            self._wait(wait_time)
+            after = self.adapter.scroll_metrics(runtime.tab)
+            runtime.persist()
+            return {
+                "page": self._page_payload(runtime),
+                "page_identity": self._page_identity_payload(runtime),
+                "direction": normalized_direction,
+                "amount": int(amount),
+                "to": normalized_to,
+                "before": before,
+                "after": after,
+                "moved": (
+                    before.get("x") != after.get("x")
+                    or before.get("y") != after.get("y")
+                ),
+            }
 
     def expand_container(
         self,
@@ -408,8 +468,9 @@ class CliService:
         ai_timeout_value = self._positive_float(ai_timeout)
         output_path = self._prepare_batch_path(output_file)
         progress_path = self._prepare_batch_path(progress_file)
-        if progress_path:
-            progress_path.write_text("", encoding="utf-8")
+        resumed_items = self._load_batch_progress(progress_path)
+        resumed_count = 0
+        processed_count = 0
 
         def current_payload(partial: bool) -> dict:
             return self._batch_detail_payload(
@@ -430,6 +491,8 @@ class CliService:
                 output_file=str(output_path) if output_path else None,
                 progress_file=str(progress_path) if progress_path else None,
                 detail_items=detail_items,
+                resumed_count=resumed_count,
+                processed_count=processed_count,
                 partial=partial,
             )
 
@@ -440,6 +503,14 @@ class CliService:
                 item_started_at = time.monotonic()
                 requested_url = self._raw_detail_item_url(list_item)
                 detail_url = self._detail_item_url(list_item, source)
+                resume_key = self._batch_progress_key(detail_url or requested_url)
+                resumed_item = resumed_items.get(resume_key)
+                if resumed_item and resumed_item.get("detail_ok") is True:
+                    detail_items.append(dict(resumed_item))
+                    detail_pages_extracted += 1
+                    resumed_count += 1
+                    continue
+                processed_count += 1
                 merged = {
                     "title": list_item.get("title") or list_item.get("name"),
                     "url": detail_url or requested_url,
@@ -584,6 +655,8 @@ class CliService:
         output_file: str | None,
         progress_file: str | None,
         detail_items: list[dict],
+        resumed_count: int,
+        processed_count: int,
         partial: bool,
     ) -> dict:
         return {
@@ -607,6 +680,8 @@ class CliService:
             "progress_file": progress_file,
             "partial": partial,
             "item_count": len(detail_items),
+            "resumed_count": resumed_count,
+            "processed_count": processed_count,
             "items": list(detail_items),
         }
 
@@ -935,6 +1010,67 @@ class CliService:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    def _load_batch_progress(self, path: Path | None) -> dict[str, dict]:
+        if not path or not path.exists():
+            return {}
+        completed: dict[str, dict] = {}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return {}
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(entry, dict) or entry.get("detail_ok") is not True:
+                continue
+            item = entry.get("item")
+            if not isinstance(item, dict):
+                item = {
+                    "title": entry.get("title"),
+                    "url": entry.get("url"),
+                    "requested_url": entry.get("url"),
+                    "final_url": entry.get("url"),
+                    "list_info": {},
+                    "detail_info": (
+                        entry.get("detail_info")
+                        if isinstance(entry.get("detail_info"), dict)
+                        else {}
+                    ),
+                    "detail_ok": True,
+                    "detail_error": None,
+                }
+            key = self._batch_progress_key(
+                item.get("final_url")
+                or item.get("url")
+                or item.get("requested_url")
+                or entry.get("url")
+            )
+            if key:
+                completed[key] = item
+        return completed
+
+    @staticmethod
+    def _batch_progress_key(url: object) -> str:
+        value = str(url or "").strip()
+        if not value:
+            return ""
+        try:
+            parsed = urlparse(value)
+        except Exception:
+            return value.rstrip("/")
+        return urlunparse(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+                parsed.path.rstrip("/") or "/",
+                "",
+                parsed.query,
+                "",
+            )
+        )
+
     def _persist_batch_item(
         self,
         *,
@@ -953,6 +1089,7 @@ class CliService:
             "detail_ok": bool(item.get("detail_ok")),
             "detail_info": item.get("detail_info") if isinstance(item.get("detail_info"), dict) else {},
             "detail_error": item.get("detail_error"),
+            "item": item,
         }
         self._append_batch_progress(progress_path, entry)
         self._write_batch_output(output_path, payload)

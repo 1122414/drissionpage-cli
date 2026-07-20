@@ -283,6 +283,7 @@
 
     <script>
       const searchInput = document.getElementById("search-input");
+      const searchRegion = document.getElementById("search-region");
       const searchButton = document.getElementById("search-button");
       const hotButton = document.getElementById("hot-button");
       const searchStatus = document.getElementById("search-status");
@@ -293,12 +294,18 @@
       const mockAgreementInput = document.getElementById("mock-agreement-input");
       let currentPage = 1;
 
-      searchButton.addEventListener("click", () => {
+      const applySearch = () => {
         const query = searchInput.value.trim() || "empty";
         searchStatus.textContent = `Searching: ${query}`;
         hotButton.textContent = "Searched";
         searchButton.setAttribute("aria-label", "Search complete");
         searchButton.setAttribute("title", "Search complete");
+      };
+
+      searchButton.addEventListener("click", applySearch);
+      searchRegion.addEventListener("submit", (event) => {
+        event.preventDefault();
+        applySearch();
       });
 
       nextPageButton.addEventListener("click", () => {

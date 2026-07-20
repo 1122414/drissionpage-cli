@@ -11,6 +11,28 @@ from dp_cli.models import (
 
 BODY_LOCATOR = "xpath:/html/body"
 
+SCROLL_METRICS_SCRIPT = """
+(() => {
+  const root = document.scrollingElement || document.documentElement;
+  const x = Number(window.scrollX || root.scrollLeft || 0);
+  const y = Number(window.scrollY || root.scrollTop || 0);
+  const viewportWidth = Number(window.innerWidth || root.clientWidth || 0);
+  const viewportHeight = Number(window.innerHeight || root.clientHeight || 0);
+  const scrollWidth = Number(root.scrollWidth || 0);
+  const scrollHeight = Number(root.scrollHeight || 0);
+  return {
+    x,
+    y,
+    viewport_width: viewportWidth,
+    viewport_height: viewportHeight,
+    scroll_width: scrollWidth,
+    scroll_height: scrollHeight,
+    at_top: y <= 1,
+    at_bottom: y + viewportHeight >= scrollHeight - 2
+  };
+})()
+"""
+
 SHARED_JS_HELPERS = """
 function compactText(value) {
   return (value || '').replace(/\\s+/g, ' ').trim();
@@ -912,6 +934,80 @@ class DrissionPageAdapter:
                 "this.scrollIntoView({block: 'center', inline: 'center'});"
             )
 
+    def scroll_metrics(self, tab) -> dict:
+        result = tab.run_js(SCROLL_METRICS_SCRIPT, as_expr=True)
+        return result if isinstance(result, dict) else {}
+
+    def scroll_page(
+        self,
+        tab,
+        *,
+        direction: str = "down",
+        amount: int = 900,
+        to: str | None = None,
+    ) -> None:
+        normalized_direction = str(direction or "down").lower()
+        normalized_to = str(to or "").lower()
+        try:
+            if normalized_to == "top":
+                tab.scroll.to_top()
+            elif normalized_to == "bottom":
+                tab.scroll.to_bottom()
+            elif normalized_to == "half":
+                tab.scroll.to_half()
+            elif normalized_to == "leftmost":
+                tab.scroll.to_leftmost()
+            elif normalized_to == "rightmost":
+                tab.scroll.to_rightmost()
+            elif normalized_direction == "up":
+                tab.scroll.up(amount)
+            elif normalized_direction == "left":
+                tab.scroll.left(amount)
+            elif normalized_direction == "right":
+                tab.scroll.right(amount)
+            else:
+                tab.scroll.down(amount)
+            return
+        except Exception:
+            pass
+
+        if normalized_to == "top":
+            tab.run_js("window.scrollTo(window.scrollX, 0);")
+        elif normalized_to == "bottom":
+            tab.run_js(
+                "window.scrollTo(window.scrollX, "
+                "(document.scrollingElement || document.documentElement).scrollHeight);"
+            )
+        elif normalized_to == "half":
+            tab.run_js(
+                "window.scrollTo(window.scrollX, "
+                "(document.scrollingElement || document.documentElement).scrollHeight / 2);"
+            )
+        elif normalized_to == "leftmost":
+            tab.run_js("window.scrollTo(0, window.scrollY);")
+        elif normalized_to == "rightmost":
+            tab.run_js(
+                "window.scrollTo("
+                "(document.scrollingElement || document.documentElement).scrollWidth, "
+                "window.scrollY);"
+            )
+        else:
+            delta_x = (
+                -amount
+                if normalized_direction == "left"
+                else amount
+                if normalized_direction == "right"
+                else 0
+            )
+            delta_y = (
+                -amount
+                if normalized_direction == "up"
+                else amount
+                if normalized_direction == "down"
+                else 0
+            )
+            tab.run_js("window.scrollBy(arguments[0], arguments[1]);", delta_x, delta_y)
+
     def click(self, element) -> None:
         offset = None
         try:
@@ -926,8 +1022,8 @@ class DrissionPageAdapter:
                 pass
         element.click()
 
-    def type_text(self, element, text: str) -> None:
-        element.input(text, clear=True)
+    def type_text(self, element, text: str, submit: bool = False) -> None:
+        element.input(f"{text}\n" if submit else text, clear=True)
 
     def _serialize_elements(self, elements, require_element_type: bool = True) -> list[SnapshotNodeRecord]:
         records: OrderedDict[str, SnapshotNodeRecord] = OrderedDict()

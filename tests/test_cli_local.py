@@ -1620,6 +1620,135 @@ def test_find_text_matches_leading_zero_episode(local_fixture_server, local_sess
         cleanup_session(local_session)
 
 
+def test_type_submit_applies_search_filter(local_fixture_server, local_session):
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        found = run_cli(
+            "find",
+            "--session",
+            local_session,
+            "--headless",
+            "--locator",
+            "#search-input",
+        )
+        search_input = select_node(
+            found["data"]["nodes"],
+            ref_type="element",
+            element_id=SEARCH_INPUT_ID,
+        )
+
+        typed = run_cli(
+            "type",
+            "--session",
+            local_session,
+            "--headless",
+            "--ref",
+            search_input["ref"],
+            "--text",
+            "Boston",
+            "--submit",
+            "--wait-time",
+            "0.1",
+        )
+        status = run_cli(
+            "eval",
+            "document.querySelector('#search-status').textContent",
+            "--session",
+            local_session,
+            "--headless",
+        )
+
+        assert typed["ok"] is True
+        assert typed["data"]["submitted"] is True
+        assert typed["data"]["typed_text"] == "Boston"
+        assert status["data"]["result"] == "Searching: Boston"
+    finally:
+        cleanup_session(local_session)
+
+
+def test_scroll_command_returns_before_after_metrics(local_fixture_server, local_session):
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+
+        scrolled = run_cli(
+            "scroll",
+            "--session",
+            local_session,
+            "--headless",
+            "--direction",
+            "down",
+            "--amount",
+            "700",
+        )
+        bottom = run_cli(
+            "scroll",
+            "--session",
+            local_session,
+            "--headless",
+            "--to",
+            "bottom",
+        )
+
+        assert scrolled["ok"] is True
+        assert scrolled["data"]["direction"] == "down"
+        assert scrolled["data"]["amount"] == 700
+        assert scrolled["data"]["after"]["y"] >= scrolled["data"]["before"]["y"]
+        assert bottom["data"]["to"] == "bottom"
+        assert bottom["data"]["after"]["y"] >= scrolled["data"]["after"]["y"]
+        assert bottom["data"]["after"]["at_bottom"] is True
+    finally:
+        cleanup_session(local_session)
+
+
+def test_batch_detail_resumes_successful_rows_from_progress_file(
+    local_fixture_server,
+    local_session,
+    tmp_path,
+):
+    detail_url = local_fixture_server.url.replace("index.html", "detail.html")
+    items = [
+        {"title": "First", "url": f"{detail_url}?item=1"},
+        {"title": "Second", "url": f"{detail_url}?item=2"},
+    ]
+    progress_file = tmp_path / "detail-progress.jsonl"
+    output_file = tmp_path / "detail-output.json"
+    common_args = (
+        "batch-detail-extract",
+        "--session",
+        local_session,
+        "--headless",
+        "--items-json",
+        json.dumps(items),
+        "--source-url",
+        local_fixture_server.url,
+        "--extractor",
+        "legacy-js",
+        "--navigation-mode",
+        "direct",
+        "--schema",
+        "title",
+        "description",
+        "--progress-file",
+        str(progress_file),
+        "--output-file",
+        str(output_file),
+    )
+    try:
+        first = run_cli(*common_args)
+        second = run_cli(*common_args)
+
+        assert first["ok"] is True
+        assert first["data"]["processed_count"] == 2
+        assert first["data"]["resumed_count"] == 0
+        assert second["ok"] is True
+        assert second["data"]["processed_count"] == 0
+        assert second["data"]["resumed_count"] == 2
+        assert second["data"]["detail_pages_extracted"] == 2
+        assert len(second["data"]["items"]) == 2
+    finally:
+        cleanup_session(local_session)
+
+
 def test_find_text_recognizes_tab_item_span_as_element(local_fixture_server, local_session):
     try:
         run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")

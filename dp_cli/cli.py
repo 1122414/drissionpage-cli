@@ -44,6 +44,28 @@ def build_parser() -> argparse.ArgumentParser:
     target_group.add_argument("--ref")
     target_group.add_argument("--locator")
     type_parser.add_argument("--text", required=True)
+    type_parser.add_argument(
+        "--submit",
+        action="store_true",
+        help="Press Enter after typing to submit the surrounding form.",
+    )
+
+    scroll_parser = subparsers.add_parser(
+        "scroll",
+        help="Scroll the current page and return before/after viewport metrics.",
+    )
+    scroll_parser.add_argument(
+        "--direction",
+        choices=("down", "up", "left", "right"),
+        default="down",
+    )
+    scroll_parser.add_argument("--amount", type=int, default=900)
+    scroll_parser.add_argument(
+        "--to",
+        choices=("top", "bottom", "half", "leftmost", "rightmost"),
+        default=None,
+    )
+    _add_common_args(scroll_parser)
 
     expand_parser = subparsers.add_parser("expand", help="Expand a container subtree.")
     expand_parser.add_argument("ref")
@@ -166,6 +188,18 @@ _COMMAND_MAP: dict[str, Callable[[argparse.Namespace, CliService], dict[str, Any
             wait_time=a.wait_time,
         ),
     ),
+    "scroll": lambda a, s: success(
+        a.session,
+        "scroll",
+        s.scroll_page(
+            session=a.session,
+            direction=a.direction,
+            amount=a.amount,
+            to=a.to,
+            headless=a.headless,
+            wait_time=a.wait_time,
+        ),
+    ),
     "type": lambda a, s: success(
         a.session,
         "type",
@@ -174,6 +208,7 @@ _COMMAND_MAP: dict[str, Callable[[argparse.Namespace, CliService], dict[str, Any
             session=a.session,
             ref=getattr(a, "ref", None),
             locator=getattr(a, "locator", None),
+            submit=getattr(a, "submit", False),
             headless=a.headless,
             wait_time=a.wait_time,
         ),
