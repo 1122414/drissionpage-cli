@@ -1876,3 +1876,62 @@ def test_snapshot_index_structure_meets_design_criteria(local_fixture_server, lo
             assert len(text) <= 60, f"deep_index text too long ({len(text)} chars): {text[:70]}"
     finally:
         cleanup_session(local_session)
+
+
+def test_snapshot_rebinds_semantic_ref_after_dom_insertion(
+    local_fixture_server,
+    local_session,
+):
+    try:
+        run_cli(
+            "open",
+            local_fixture_server.url,
+            "--session",
+            local_session,
+            "--headless",
+        )
+        first = run_cli(
+            "snapshot",
+            "--mode",
+            "full",
+            "--session",
+            local_session,
+            "--headless",
+        )
+        first_button = next(
+            node
+            for node in first["data"]["nodes"]
+            if node.get("id") == "search-button"
+        )
+        run_cli(
+            "eval",
+            (
+                "document.getElementById('search-button')."
+                "insertAdjacentHTML('beforebegin',"
+                "'<button id=\"injected-ad\" type=\"button\">Ad</button>')"
+            ),
+            "--session",
+            local_session,
+            "--headless",
+        )
+        second = run_cli(
+            "snapshot",
+            "--mode",
+            "full",
+            "--session",
+            local_session,
+            "--headless",
+        )
+        second_button = next(
+            node
+            for node in second["data"]["nodes"]
+            if node.get("id") == "search-button"
+        )
+
+        assert first_button["ref"] == second_button["ref"]
+        assert first_button["xpath"] != second_button["xpath"]
+        assert second_button["ref_rebound"] is True
+        assert second_button["fingerprint_version"] == "2"
+        assert first_button["ref"] in second["data"]["delta"]["rebound_refs"]
+    finally:
+        cleanup_session(local_session)

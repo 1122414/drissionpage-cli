@@ -104,7 +104,7 @@ class CliService:
                 root_xpath = item["xpath"]
 
             records = self.adapter.snapshot_nodes(runtime.tab, root_xpath=root_xpath, depth=snapshot_depth)
-            nodes = runtime.upsert_nodes(records)
+            nodes = runtime.upsert_nodes(records, track_delta=ref is None)
             index = self._build_index(nodes)
 
             payload = {
@@ -116,6 +116,7 @@ class CliService:
                 "root_ref": root_ref,
                 "depth": snapshot_depth,
                 "index": index,
+                "delta": dict(runtime.state.last_snapshot_diff or {}),
             }
             artifact_file = self._write_snapshot_artifact(
                 session=session,
@@ -129,6 +130,7 @@ class CliService:
                     nodes=nodes,
                     planner_view=index,
                     schema_version="0.6",
+                    delta=payload["delta"],
                 ),
                 snapshot_id=runtime.state.active_page.snapshot_id or "snapshot",
             )
@@ -401,7 +403,14 @@ class CliService:
             return {
                 "ref": ref,
                 "fingerprint": item.get("fingerprint", ""),
-                "confidence": 0.9 if item.get("fingerprint") else 0.0,
+                "semantic_fingerprint": item.get("semantic_fingerprint", ""),
+                "fingerprint_version": item.get("fingerprint_version", "1"),
+                "confidence": (
+                    0.98
+                    if item.get("semantic_fingerprint")
+                    else (0.9 if item.get("fingerprint") else 0.0)
+                ),
+                "ref_rebound": bool(item.get("ref_rebound")),
                 "locator_candidates": item.get("locator_candidates", []),
                 "re_resolve_result": "matched",
                 "page": self._page_payload(runtime),
@@ -717,6 +726,7 @@ class CliService:
                 "element_ref_count": len(runtime.state.element_refs),
                 "last_snapshot_file": runtime.state.last_snapshot_file,
                 "last_snapshot_mode": runtime.state.last_snapshot_mode,
+                "last_snapshot_diff": runtime.state.last_snapshot_diff,
             }
 
     def close_session(self, session: str = DEFAULT_SESSION) -> dict:

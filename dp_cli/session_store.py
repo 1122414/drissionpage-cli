@@ -249,6 +249,8 @@ class SessionStore:
         data.setdefault("next_element_index", 1)
         data.setdefault("last_snapshot_file", None)
         data.setdefault("last_snapshot_mode", None)
+        data.setdefault("last_snapshot_fingerprints", {})
+        data.setdefault("last_snapshot_diff", {})
         data.pop("refs", None)
         data.pop("next_ref_index", None)
         data.pop("region_refs", None)

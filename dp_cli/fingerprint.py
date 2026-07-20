@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
+from urllib.parse import urlsplit
 
 
 class NodeFingerprint:
+    """Legacy v1 fingerprint. Kept byte-compatible for stored sessions."""
+
     def compute(self, node: dict) -> str:
         parts = []
         if node.get("role"):
@@ -83,3 +88,133 @@ class FingerprintIndex:
 
     def clear(self) -> None:
         self._index.clear()
+
+
+class SemanticFingerprint:
+    """Versioned semantic identity that deliberately excludes xpath and classes."""
+
+    VERSION = "2"
+    _DYNAMIC_ID = re.compile(
+        r"(?:^|[-_])(?:\d{5,}|[a-f0-9]{10,})(?:$|[-_])",
+        flags=re.IGNORECASE,
+    )
+
+    def features(
+        self,
+        node: dict,
+        lookup: dict[str, dict] | None = None,
+    ) -> dict[str, object]:
+        lookup = lookup or {}
+        context = node.get("context") or {}
+        accessible_name = (
+            node.get("name")
+            or node.get("aria_label")
+            or node.get("label")
+            or node.get("placeholder")
+            or node.get("alt")
+            or ""
+        )
+        element_id = str(node.get("id") or node.get("element_id") or "")
+        if self._DYNAMIC_ID.search(element_id):
+            element_id = ""
+        features: dict[str, object] = {
+            "tag": str(node.get("tag") or "").lower(),
+            "role": str(node.get("role") or "").lower(),
+            "name": self._normalize(accessible_name),
+            "id": self._normalize(element_id),
+            "href": self._stable_url(node.get("href")),
+            "input_type": str(node.get("input_type") or "").lower(),
+            "landmark": self._normalize(context.get("landmark")),
+            "form": self._normalize(context.get("form")),
+            "list": self._normalize(context.get("list")),
+            "ancestor_path": self._ancestor_path(node, lookup),
+        }
+        return {key: value for key, value in features.items() if value}
+
+    def compute(
+        self,
+        node: dict,
+        lookup: dict[str, dict] | None = None,
+    ) -> str:
+        raw = json.dumps(
+            self.features(node, lookup),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+        return f"sf{self.VERSION}_{digest}"
+
+    def similarity(
+        self,
+        left: dict[str, object],
+        right: dict[str, object],
+    ) -> float:
+        weights = {
+            "tag": 0.10,
+            "role": 0.15,
+            "name": 0.35,
+            "id": 0.15,
+            "href": 0.15,
+            "input_type": 0.04,
+            "landmark": 0.02,
+            "form": 0.02,
+            "list": 0.01,
+            "ancestor_path": 0.01,
+        }
+        available = 0.0
+        matched = 0.0
+        for key, weight in weights.items():
+            left_value = left.get(key)
+            right_value = right.get(key)
+            if not left_value or not right_value:
+                continue
+            available += weight
+            if left_value == right_value:
+                matched += weight
+        return matched / available if available else 0.0
+
+    @staticmethod
+    def _normalize(value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        return text[:120]
+
+    @staticmethod
+    def _stable_url(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = urlsplit(text)
+        except ValueError:
+            return text[:160]
+        if parsed.scheme or parsed.netloc:
+            return f"{parsed.netloc.lower()}{parsed.path.rstrip('/')}"[:160]
+        return parsed.path.rstrip("/")[:160]
+
+    def _ancestor_path(
+        self,
+        node: dict,
+        lookup: dict[str, dict],
+    ) -> list[str]:
+        path = []
+        current = node
+        seen = set()
+        for _ in range(4):
+            parent_key = current.get("parent_ref") or current.get("parent_xpath")
+            if not parent_key or parent_key in seen:
+                break
+            seen.add(parent_key)
+            parent = lookup.get(str(parent_key))
+            if not isinstance(parent, dict):
+                break
+            label = (
+                parent.get("role")
+                or parent.get("tag")
+                or parent.get("name")
+                or ""
+            )
+            if label:
+                path.insert(0, self._normalize(label))
+            current = parent
+        return path

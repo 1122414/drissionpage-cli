@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from contextlib import AbstractContextManager
 
-from dp_cli.fingerprint import FingerprintIndex, NodeFingerprint
+from dp_cli.fingerprint import FingerprintIndex, NodeFingerprint, SemanticFingerprint
 from dp_cli.locator import LocatorGenerator
 from dp_cli.models import ActivePage
 from dp_cli.session_store import new_id, utc_now
@@ -118,6 +118,8 @@ class RuntimeContext(AbstractContextManager):
             self.state.next_element_index = 1
             self.state.last_snapshot_file = None
             self.state.last_snapshot_mode = None
+            self.state.last_snapshot_fingerprints = {}
+            self.state.last_snapshot_diff = {}
         elif not self.state.runtime_id:
             self.state.runtime_id = self.meta.runtime_id
         self.meta.browser_pid = current_pid
@@ -138,6 +140,8 @@ class RuntimeContext(AbstractContextManager):
                 snapshot_id=None,
                 snapshot_seq=snapshot_seq,
             )
+            self.state.last_snapshot_fingerprints = {}
+            self.state.last_snapshot_diff = {}
         else:
             self.state.active_page.title = info["title"]
 
@@ -155,7 +159,7 @@ class RuntimeContext(AbstractContextManager):
         self.manager.save_meta(self.meta)
         self.manager.save_state(self.state)
 
-    def upsert_nodes(self, records) -> list[dict]:
+    def upsert_nodes(self, records, *, track_delta: bool = False) -> list[dict]:
         active_page = self.state.active_page
         refs_by_type = {
             "container": self.state.container_refs,
@@ -170,6 +174,7 @@ class RuntimeContext(AbstractContextManager):
             "element": "e",
         }
         xpath_to_ref = {}
+        existing_by_ref = {}
         for ref_map in refs_by_type.values():
             for ref, item in ref_map.items():
                 if (
@@ -179,20 +184,100 @@ class RuntimeContext(AbstractContextManager):
                     and item.get("page_id") == active_page.page_id
                 ):
                     xpath_to_ref[item["xpath"]] = ref
+                    existing_by_ref[ref] = item
+
+        semantic = SemanticFingerprint()
+        candidate_lookup: dict[str, dict] = {}
+        candidate_payloads = []
+        for record in records:
+            candidate = record.to_output("")
+            candidate["xpath"] = record.xpath
+            candidate["parent_xpath"] = record.parent_xpath
+            candidate_lookup[record.xpath] = candidate
+            candidate_payloads.append((record, candidate))
+        for _record, candidate in candidate_payloads:
+            candidate["semantic_features"] = semantic.features(
+                candidate,
+                candidate_lookup,
+            )
+            candidate["semantic_fingerprint"] = semantic.compute(
+                candidate,
+                candidate_lookup,
+            )
+
+        semantic_to_refs: dict[tuple[str, str], list[str]] = {}
+        for ref, item in existing_by_ref.items():
+            semantic_fingerprint = str(item.get("semantic_fingerprint") or "")
+            if semantic_fingerprint:
+                key = (str(item.get("ref_type") or ""), semantic_fingerprint)
+                semantic_to_refs.setdefault(key, []).append(ref)
 
         assigned: list[tuple[object, str]] = []
-        for record in records:
+        assigned_candidates: list[dict] = []
+        used_refs = set()
+        rebound_refs = []
+        for record, candidate in candidate_payloads:
             ref = xpath_to_ref.get(record.xpath)
+            if ref is not None:
+                existing = existing_by_ref.get(ref) or {}
+                existing_features = existing.get("semantic_features")
+                if isinstance(existing_features, dict):
+                    similarity = semantic.similarity(
+                        existing_features,
+                        candidate["semantic_features"],
+                    )
+                    if similarity < 0.55:
+                        ref = None
+            if ref is None:
+                exact_refs = semantic_to_refs.get(
+                    (record.ref_type, candidate["semantic_fingerprint"]),
+                    [],
+                )
+                ref = next(
+                    (candidate_ref for candidate_ref in exact_refs if candidate_ref not in used_refs),
+                    None,
+                )
+            if ref is None:
+                scored = []
+                for candidate_ref, existing in existing_by_ref.items():
+                    if candidate_ref in used_refs:
+                        continue
+                    if existing.get("ref_type") != record.ref_type:
+                        continue
+                    existing_features = existing.get("semantic_features")
+                    if not isinstance(existing_features, dict):
+                        continue
+                    scored.append(
+                        (
+                            semantic.similarity(
+                                existing_features,
+                                candidate["semantic_features"],
+                            ),
+                            candidate_ref,
+                        )
+                    )
+                scored.sort(reverse=True)
+                best = scored[0] if scored else (0.0, "")
+                runner_up = scored[1][0] if len(scored) > 1 else 0.0
+                if best[0] >= 0.82 and best[0] - runner_up >= 0.12:
+                    ref = best[1]
             if ref is None:
                 attr = next_index_attr[record.ref_type]
                 ref = f"{prefix[record.ref_type]}{getattr(self.state, attr)}"
                 setattr(self.state, attr, getattr(self.state, attr) + 1)
                 xpath_to_ref[record.xpath] = ref
+            else:
+                previous_xpath = (existing_by_ref.get(ref) or {}).get("xpath")
+                if previous_xpath and previous_xpath != record.xpath:
+                    rebound_refs.append(ref)
+                xpath_to_ref[record.xpath] = ref
+            used_refs.add(ref)
             assigned.append((record, ref))
+            assigned_candidates.append(candidate)
 
         fp_gen = NodeFingerprint()
         payloads = []
-        for record, ref in assigned:
+        for (record, ref), candidate in zip(assigned, assigned_candidates):
             item = record.to_output(ref)
             item["xpath"] = record.xpath
             item["parent_ref"] = xpath_to_ref.get(record.parent_xpath) if record.parent_xpath else None
@@ -203,10 +288,38 @@ class RuntimeContext(AbstractContextManager):
             item["snapshot_id"] = active_page.snapshot_id
             item["url"] = active_page.url
             item["fingerprint"] = fp_gen.compute(item)
+            item["semantic_features"] = candidate["semantic_features"]
+            item["semantic_fingerprint"] = candidate["semantic_fingerprint"]
+            item["fingerprint_version"] = SemanticFingerprint.VERSION
+            item["ref_rebound"] = ref in rebound_refs
             item["locator_candidates"] = self.locator_generator.generate(item)
             self.fingerprint_index.add(ref, item["fingerprint"])
+            self.fingerprint_index.add(ref, item["semantic_fingerprint"])
             refs_by_type[record.ref_type][ref] = item
             payloads.append(item)
+
+        if track_delta:
+            previous = dict(self.state.last_snapshot_fingerprints or {})
+            current = {
+                item["ref"]: item["semantic_fingerprint"]
+                for item in payloads
+            }
+            added = sorted(set(current) - set(previous))
+            removed = sorted(set(previous) - set(current))
+            changed = sorted(
+                ref
+                for ref in set(previous) & set(current)
+                if previous[ref] != current[ref]
+            )
+            self.state.last_snapshot_diff = {
+                "from_snapshot_id": self.state.active_page.snapshot_id,
+                "added_refs": added,
+                "removed_refs": removed,
+                "changed_refs": changed,
+                "rebound_refs": sorted(set(rebound_refs)),
+                "unchanged_count": len(set(previous) & set(current)) - len(changed),
+            }
+            self.state.last_snapshot_fingerprints = current
         return payloads
 
     def remember_snapshot(self, artifact_file: str, mode: str) -> None:

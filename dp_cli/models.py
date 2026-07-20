@@ -121,6 +121,8 @@ class SnapshotNodeRecord:
     group_ref: str | None = None
     item_ref: str | None = None
     fingerprint: str = ""
+    semantic_fingerprint: str = ""
+    fingerprint_version: str = ""
     locator_candidates: list[str] = field(default_factory=list)
 
     def locator(self) -> str:
@@ -165,6 +167,10 @@ class SnapshotNodeRecord:
             result["item_ref"] = self.item_ref
         if self.fingerprint:
             result["fingerprint"] = self.fingerprint
+        if self.semantic_fingerprint:
+            result["semantic_fingerprint"] = self.semantic_fingerprint
+        if self.fingerprint_version:
+            result["fingerprint_version"] = self.fingerprint_version
         if self.locator_candidates:
             result["locator_candidates"] = self.locator_candidates
         return result
@@ -183,6 +189,7 @@ class SnapshotArtifact:
     schema_version: str = "0.6"
     groups: list[dict] = field(default_factory=list)
     recovery: dict = field(default_factory=dict)
+    delta: dict = field(default_factory=dict)
 
     def to_output(self) -> dict:
         return asdict(self)
@@ -249,6 +256,8 @@ class SessionState:
     next_element_index: int = 1
     last_snapshot_file: str | None = None
     last_snapshot_mode: str | None = None
+    last_snapshot_fingerprints: dict[str, str] = field(default_factory=dict)
+    last_snapshot_diff: dict = field(default_factory=dict)
 
 
 @dataclass

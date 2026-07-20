@@ -25,6 +25,8 @@ class TestSnapshotNodeRecordV5Fields:
         assert record.group_ref is None
         assert record.item_ref is None
         assert record.fingerprint == ""
+        assert record.semantic_fingerprint == ""
+        assert record.fingerprint_version == ""
         assert record.locator_candidates == []
 
     def test_new_fields_roundtrip(self):
@@ -38,12 +40,16 @@ class TestSnapshotNodeRecordV5Fields:
             group_ref="r10",
             item_ref="r11",
             fingerprint="fp_abc123",
+            semantic_fingerprint="sf2_abc123",
+            fingerprint_version="2",
             locator_candidates=["role=link[name='Click me']"],
         )
         assert record.kind == "control"
         assert record.group_ref == "r10"
         assert record.item_ref == "r11"
         assert record.fingerprint == "fp_abc123"
+        assert record.semantic_fingerprint == "sf2_abc123"
+        assert record.fingerprint_version == "2"
         assert record.locator_candidates == ["role=link[name='Click me']"]
 
     def test_to_output_includes_new_fields_when_set(self):
@@ -54,11 +60,15 @@ class TestSnapshotNodeRecordV5Fields:
             kind="control",
             group_ref="r10",
             fingerprint="fp_abc123",
+            semantic_fingerprint="sf2_abc123",
+            fingerprint_version="2",
         )
         output = record.to_output("e5")
         assert output["kind"] == "control"
         assert output["group_ref"] == "r10"
         assert output["fingerprint"] == "fp_abc123"
+        assert output["semantic_fingerprint"] == "sf2_abc123"
+        assert output["fingerprint_version"] == "2"
 
     def test_to_output_omits_new_fields_when_empty(self):
         record = SnapshotNodeRecord(
