@@ -897,6 +897,32 @@ class DrissionPageAdapter:
             tab.get(url)
         return self.page_info(tab)
 
+    def wait_ready(
+        self,
+        tab,
+        *,
+        condition: str,
+        locator: str | None = None,
+        timeout: float | None = None,
+        listener_started: bool = False,
+    ) -> bool:
+        """Use DrissionPage's native waits; never substitute a blind sleep."""
+        normalized = str(condition or "document").lower().replace("_", "-")
+        if normalized == "document":
+            return bool(tab.wait.doc_loaded(timeout=timeout))
+        if normalized == "element":
+            if not locator:
+                raise ValueError("element readiness requires a locator")
+            return bool(tab.wait.eles_loaded(locator, timeout=timeout))
+        if normalized == "network-idle":
+            if not listener_started:
+                tab.listen.start(True)
+            try:
+                return bool(tab.listen.wait_silent(timeout=timeout, targets_only=False))
+            finally:
+                tab.listen.stop()
+        raise ValueError(f"unsupported readiness condition: {condition}")
+
     def snapshot_nodes(self, tab, root_xpath: str | None = None, depth: int | None = None) -> list[SnapshotNodeRecord]:
         if root_xpath:
             root = tab.ele(f"xpath:{root_xpath}")

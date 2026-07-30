@@ -66,7 +66,28 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("top", "bottom", "half", "leftmost", "rightmost"),
         default=None,
     )
+    scroll_parser.add_argument(
+        "--ready-condition",
+        choices=("document", "element", "network-idle"),
+        default=None,
+        help="Use a native readiness condition after scrolling instead of a blind delay.",
+    )
+    scroll_parser.add_argument("--ready-locator", default=None)
+    scroll_parser.add_argument("--ready-timeout", type=float, default=10.0)
     _add_common_args(scroll_parser)
+
+    ready_parser = subparsers.add_parser(
+        "wait-ready",
+        help="Wait for a documented browser readiness condition and return evidence.",
+    )
+    ready_parser.add_argument(
+        "--condition",
+        choices=("document", "element", "network-idle"),
+        default="document",
+    )
+    ready_parser.add_argument("--locator", default=None)
+    ready_parser.add_argument("--timeout", type=float, default=10.0)
+    _add_common_args(ready_parser)
 
     expand_parser = subparsers.add_parser("expand", help="Expand a container subtree.")
     expand_parser.add_argument("ref")
@@ -202,6 +223,21 @@ _COMMAND_MAP: dict[str, Callable[[argparse.Namespace, CliService], dict[str, Any
             direction=a.direction,
             amount=a.amount,
             to=a.to,
+            headless=a.headless,
+            wait_time=a.wait_time,
+            ready_condition=a.ready_condition,
+            ready_locator=a.ready_locator,
+            ready_timeout=a.ready_timeout,
+        ),
+    ),
+    "wait-ready": lambda a, s: success(
+        a.session,
+        "wait-ready",
+        s.wait_ready(
+            session=a.session,
+            condition=a.condition,
+            locator=a.locator,
+            timeout=a.timeout,
             headless=a.headless,
             wait_time=a.wait_time,
         ),

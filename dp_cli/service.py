@@ -234,6 +234,9 @@ class CliService:
         to: str | None = None,
         headless: bool | None = None,
         wait_time: float = 0.0,
+        ready_condition: str | None = None,
+        ready_locator: str | None = None,
+        ready_timeout: float | None = 10.0,
     ) -> dict:
         normalized_direction = str(direction or "down").lower()
         normalized_to = str(to or "").lower() or None
@@ -254,15 +257,50 @@ class CliService:
             )
         if int(amount) <= 0:
             raise InvalidInputError("scroll --amount must be greater than zero.")
+        normalized_ready = (
+            str(ready_condition).lower().replace("_", "-")
+            if ready_condition
+            else None
+        )
+        if normalized_ready == "element" and not ready_locator:
+            raise InvalidInputError("scroll --ready-locator is required for --ready-condition element.")
 
         with self._with_runtime(session=session, headless=headless) as runtime:
             before = self.adapter.scroll_metrics(runtime.tab)
-            self.adapter.scroll_page(
-                runtime.tab,
-                direction=normalized_direction,
-                amount=int(amount),
-                to=normalized_to,
-            )
+            listener_started = False
+            readiness_started = False
+            if normalized_ready == "network-idle":
+                runtime.tab.listen.start(True)
+                listener_started = True
+            try:
+                self.adapter.scroll_page(
+                    runtime.tab,
+                    direction=normalized_direction,
+                    amount=int(amount),
+                    to=normalized_to,
+                )
+                ready = None
+                if normalized_ready:
+                    try:
+                        readiness_started = True
+                        ready = self.adapter.wait_ready(
+                            runtime.tab,
+                            condition=normalized_ready,
+                            locator=ready_locator,
+                            timeout=self._positive_float(ready_timeout),
+                            listener_started=listener_started,
+                        )
+                    except ValueError as exc:
+                        raise InvalidInputError(str(exc)) from exc
+            finally:
+                # ``wait_ready()`` owns normal listener shutdown.  If scrolling
+                # fails first, do not leave the network listener attached to a
+                # reusable browser session.
+                if listener_started and not readiness_started:
+                    try:
+                        runtime.tab.listen.stop()
+                    except Exception:
+                        pass
             self._wait(wait_time)
             after = self.adapter.scroll_metrics(runtime.tab)
             runtime.persist()
@@ -274,10 +312,53 @@ class CliService:
                 "to": normalized_to,
                 "before": before,
                 "after": after,
+                "readiness": (
+                    {
+                        "condition": normalized_ready,
+                        "ready": bool(ready),
+                        "locator": ready_locator if normalized_ready == "element" else None,
+                    }
+                    if normalized_ready
+                    else None
+                ),
                 "moved": (
                     before.get("x") != after.get("x")
                     or before.get("y") != after.get("y")
                 ),
+            }
+
+    def wait_ready(
+        self,
+        *,
+        session: str = DEFAULT_SESSION,
+        condition: str = "document",
+        locator: str | None = None,
+        timeout: float | None = 10.0,
+        headless: bool | None = None,
+        wait_time: float = 0.0,
+    ) -> dict:
+        normalized = str(condition or "document").lower().replace("_", "-")
+        if normalized == "element" and not locator:
+            raise InvalidInputError("wait-ready --locator is required for condition element.")
+        with self._with_runtime(session=session, headless=headless) as runtime:
+            try:
+                ready = self.adapter.wait_ready(
+                    runtime.tab,
+                    condition=normalized,
+                    locator=locator,
+                    timeout=self._positive_float(timeout),
+                )
+            except ValueError as exc:
+                raise InvalidInputError(str(exc)) from exc
+            self._wait(wait_time)
+            runtime.persist()
+            return {
+                "page": self._page_payload(runtime),
+                "page_identity": self._page_identity_payload(runtime),
+                "condition": normalized,
+                "locator": locator if normalized == "element" else None,
+                "timeout": self._positive_float(timeout),
+                "ready": bool(ready),
             }
 
     def expand_container(

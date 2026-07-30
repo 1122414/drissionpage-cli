@@ -110,6 +110,22 @@ python -m dp_cli open https://example.com --session demo
 
 ---
 
+### `scroll` and `wait-ready` — Evidence-based page readiness
+
+`scroll` always returns viewport metrics. For dynamic lists, add a native
+readiness condition instead of relying on `--wait-time` alone:
+
+```bash
+python -m dp_cli scroll --to bottom --ready-condition network-idle --ready-timeout 10 --session demo
+python -m dp_cli wait-ready --condition element --locator "#items" --timeout 10 --session demo
+```
+
+Supported conditions are `document`, `element` (requires `--locator`), and
+`network-idle`. The command returns `ready` evidence; it does not disguise a
+timeout as a successful delay.
+
+---
+
 ### `snapshot` — Capture page structure
 
 Return a structured page snapshot with semantic node discovery.

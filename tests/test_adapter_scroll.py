@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
+import pytest
+
 from dp_cli.adapter import DrissionPageAdapter
+from dp_cli.service import CliService
 
 
 class _NativeScroll:
@@ -57,6 +62,43 @@ class _Input:
         self.calls.append((value, clear))
 
 
+class _ReadyWait:
+    def __init__(self) -> None:
+        self.document_timeouts: list[float | None] = []
+        self.element_calls: list[tuple[str, float | None]] = []
+
+    def doc_loaded(self, timeout: float | None = None) -> bool:
+        self.document_timeouts.append(timeout)
+        return True
+
+    def eles_loaded(self, locator: str, timeout: float | None = None) -> bool:
+        self.element_calls.append((locator, timeout))
+        return True
+
+
+class _Listener:
+    def __init__(self) -> None:
+        self.started: list[object] = []
+        self.waited: list[tuple[float | None, bool]] = []
+        self.stopped = 0
+
+    def start(self, targets) -> None:
+        self.started.append(targets)
+
+    def wait_silent(self, timeout: float | None = None, targets_only: bool = False) -> bool:
+        self.waited.append((timeout, targets_only))
+        return True
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+
+class _ReadyTab:
+    def __init__(self) -> None:
+        self.wait = _ReadyWait()
+        self.listen = _Listener()
+
+
 def test_scroll_into_view_uses_drissionpage_native_waiting_scroll() -> None:
     element = _Element()
 
@@ -104,3 +146,46 @@ def test_type_text_appends_enter_when_submit_requested() -> None:
     DrissionPageAdapter().type_text(element, "Boston", submit=True)
 
     assert element.calls == [("Boston\n", True)]
+
+
+def test_wait_ready_uses_native_document_element_and_listener_apis() -> None:
+    tab = _ReadyTab()
+    adapter = DrissionPageAdapter()
+
+    assert adapter.wait_ready(tab, condition="document", timeout=2) is True
+    assert adapter.wait_ready(tab, condition="element", locator="#items", timeout=3) is True
+    assert adapter.wait_ready(tab, condition="network-idle", timeout=4) is True
+
+    assert tab.wait.document_timeouts == [2]
+    assert tab.wait.element_calls == [("#items", 3)]
+    assert tab.listen.started == [True]
+    assert tab.listen.waited == [(4, False)]
+    assert tab.listen.stopped == 1
+
+
+def test_scroll_failure_stops_a_prestarted_network_listener() -> None:
+    tab = _ReadyTab()
+
+    class _FailingAdapter:
+        def scroll_metrics(self, _tab):
+            return {"x": 0, "y": 0}
+
+        def scroll_page(self, *_args, **_kwargs):
+            raise RuntimeError("scroll failed")
+
+    class _Runtime:
+        def __init__(self) -> None:
+            self.tab = tab
+
+    @contextmanager
+    def _runtime_context():
+        yield _Runtime()
+
+    service = CliService(adapter=_FailingAdapter())
+    setattr(service, "_with_runtime", lambda **_kwargs: _runtime_context())
+
+    with pytest.raises(RuntimeError, match="scroll failed"):
+        service.scroll_page(ready_condition="network-idle")
+
+    assert tab.listen.started == [True]
+    assert tab.listen.stopped == 1

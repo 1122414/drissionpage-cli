@@ -1241,6 +1241,21 @@ def test_common_wait_time_argument_is_available_to_batch_detail_command():
     assert args.headless is None
 
 
+def test_ready_wait_and_scroll_readiness_arguments_are_available():
+    ready = build_parser().parse_args(
+        ["wait-ready", "--condition", "element", "--locator", "#items", "--timeout", "8"]
+    )
+    scroll = build_parser().parse_args(
+        ["scroll", "--ready-condition", "network-idle", "--ready-timeout", "6"]
+    )
+
+    assert ready.condition == "element"
+    assert ready.locator == "#items"
+    assert ready.timeout == 8
+    assert scroll.ready_condition == "network-idle"
+    assert scroll.ready_timeout == 6
+
+
 def test_session_close_parser_does_not_require_browser_mode():
     args = build_parser().parse_args(["session", "close", "--session", "unit"])
     assert args.command == "session"
@@ -1696,6 +1711,28 @@ def test_scroll_command_returns_before_after_metrics(local_fixture_server, local
         assert bottom["data"]["to"] == "bottom"
         assert bottom["data"]["after"]["y"] >= scrolled["data"]["after"]["y"]
         assert bottom["data"]["after"]["at_bottom"] is True
+    finally:
+        cleanup_session(local_session)
+
+
+def test_wait_ready_uses_a_document_readiness_condition(local_fixture_server, local_session):
+    try:
+        run_cli("open", local_fixture_server.url, "--session", local_session, "--headless")
+        ready = run_cli(
+            "wait-ready",
+            "--condition",
+            "document",
+            "--timeout",
+            "3",
+            "--session",
+            local_session,
+            "--headless",
+        )
+
+        assert ready["ok"] is True
+        assert ready["action"] == "wait-ready"
+        assert ready["data"]["condition"] == "document"
+        assert ready["data"]["ready"] is True
     finally:
         cleanup_session(local_session)
 
